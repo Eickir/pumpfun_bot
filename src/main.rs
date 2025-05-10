@@ -1,10 +1,9 @@
 use dotenv::dotenv;
 use std::{env, sync::Arc};
 use anyhow::Result;
-use tracing::{info, error};
+use tracing::info;
 use tokio::signal;
 use solana_sdk::signature::Signature;
-use futures_util::StreamExt;
 use dashmap::DashMap;
 
 mod modules;
@@ -36,11 +35,11 @@ async fn main() -> Result<()> {
     //    - blockmeta_tx: pour SubscribeUpdateBlockMeta
     //    - pumpfun_tx: pour toutes les transactions PumpFun
     //    - wallet_tx: pour les transactions associées à votre wallet
-    let (blockmeta_tx, mut blockmeta_rx) =
+    let (blockmeta_tx, blockmeta_rx) =
         flume::unbounded::<SubscribeUpdateBlockMeta>();
-    let (pumpfun_tx, mut pumpfun_rx) =
+    let (pumpfun_tx, pumpfun_rx) =
         flume::unbounded::<SubscribeUpdateTransaction>();
-    let (wallet_tx, mut wallet_rx) =
+    let (wallet_tx, wallet_rx) =
         flume::unbounded::<SubscribeUpdateTransaction>();
 
     // 5) Subscription gRPC avec reconnexion
