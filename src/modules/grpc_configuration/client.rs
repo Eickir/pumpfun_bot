@@ -147,46 +147,47 @@ impl Client {
     /// Gère un flux unique et distribue vers 3 canaux
     async fn handle_stream(
         &self,
-        receiver: impl StreamExt<Item = Result<SubscribeUpdate, Status>>
-                      + Unpin
-                      + Send
-                      + 'static,
+        receiver: impl StreamExt<Item = Result<SubscribeUpdate, Status>> + Unpin,
         blockmeta_tx: Arc<Sender<SubscribeUpdateBlockMeta>>,
         pumpfun_tx:   Arc<Sender<SubscribeUpdateTransaction>>,
         wallet_tx:    Arc<Sender<SubscribeUpdateTransaction>>,
         concurrency_limit: usize,
     ) {
+        use futures_util::StreamExt;
+    
         receiver
-          .for_each_concurrent(Some(concurrency_limit), {
-            let blockmeta_tx = blockmeta_tx.clone();
-            let pumpfun_tx   = pumpfun_tx.clone();
-            let wallet_tx    = wallet_tx.clone();
-            move |maybe_update| {
-              let blockmeta_tx = blockmeta_tx.clone();
-              let pumpfun_tx   = pumpfun_tx.clone();
-              let wallet_tx    = wallet_tx.clone();
-              async move {
-                if let Ok(update) = maybe_update {
-                  // 1) BlockMeta → canal dédié
-                  if let Some(UpdateOneof::BlockMeta(bm)) = update.update_oneof.clone() {
-                    let _ = blockmeta_tx.send_async(bm).await;
-                  }
-
-                  // 2) Transaction → choisissez un canal en fonction du filtre
-                  if let Some(UpdateOneof::Transaction(tx)) = update.update_oneof {
-                    let filters = update.filters;
-                    if filters.iter().any(|f| f == "my_wallet_transaction_listener") {
-                      // Priorité wallet
-                      let _ = wallet_tx.send_async(tx).await;
-                    } else if filters.iter().any(|f| f == "pumpfun_listener") {
-                      // Sinon PumpFun
-                      let _ = pumpfun_tx.send_async(tx).await;
+            .map(|maybe_update| {
+                let blockmeta_tx = blockmeta_tx.clone();
+                let pumpfun_tx   = pumpfun_tx.clone();
+                let wallet_tx    = wallet_tx.clone();
+    
+                async move {
+                    if let Ok(update) = maybe_update {
+                        // 1) BlockMeta
+                        if let Some(UpdateOneof::BlockMeta(bm)) =
+                            update.update_oneof.clone()
+                        {
+                            let _ = blockmeta_tx.send_async(bm).await;
+                        }
+                        // 2) Transaction
+                        if let Some(UpdateOneof::Transaction(tx)) =
+                            update.update_oneof
+                        {
+                            // Choix du canal selon filters
+                            if update.filters.iter().any(|f| f == "my_wallet_transaction_listener") {
+                                let _ = wallet_tx.send_async(tx).await;
+                            } else {
+                                let _ = pumpfun_tx.send_async(tx).await;
+                            }
+                        }
                     }
-                  }
                 }
-              }
-            }
-          })
-          .await;
+            })
+            // Concurrence sur le .send_async mais rendu en ordre d'origine
+            .buffered(concurrency_limit)
+            // on consomme les futures renvoyées par `map`
+            .for_each(|_| async {})
+            .await;
     }
+    
 }

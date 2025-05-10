@@ -24,17 +24,16 @@ async fn main() -> Result<()> {
     dotenv().ok();
     info!("🚀 Démarrage du bot gRPC…");
 
-    // 2) Endpoint & token
-    let endpoint = env::var("GRPC_ENDPOINT").expect("GRPC_ENDPOINT doit être défini");
-    let x_token  = env::var("X_TOKEN").expect("X_TOKEN doit être défini");
+    // 2) Récupère endpoint & token d'env
+    let endpoint = env::var("GRPC_ENDPOINT")
+        .expect("GRPC_ENDPOINT doit être défini");
+    let x_token = env::var("X_TOKEN")
+        .expect("X_TOKEN doit être défini");
 
-    // 3) Client gRPC
+    // 3) Crée le client gRPC
     let client = Arc::new(Client::new(endpoint, x_token));
 
-    // 4) Canaux Flume :
-    //    - blockmeta_tx: pour SubscribeUpdateBlockMeta
-    //    - pumpfun_tx: pour toutes les transactions PumpFun
-    //    - wallet_tx: pour les transactions associées à votre wallet
+    // 4) Crée les canaux flume
     let (blockmeta_tx, blockmeta_rx) =
         flume::unbounded::<SubscribeUpdateBlockMeta>();
     let (pumpfun_tx, pumpfun_rx) =
@@ -42,22 +41,24 @@ async fn main() -> Result<()> {
     let (wallet_tx, wallet_rx) =
         flume::unbounded::<SubscribeUpdateTransaction>();
 
-    // 5) Subscription gRPC avec reconnexion
+    // 5) Lance la souscription gRPC en arrière-plan
     {
         let client = Arc::clone(&client);
-        tokio::spawn(client.subscribe_with_reconnect(
-            Arc::new(blockmeta_tx),
-            Arc::new(pumpfun_tx),
-            Arc::new(wallet_tx),
-            1000,
-        ));
+        tokio::spawn(async move {
+            client.subscribe_with_reconnect(
+                Arc::new(blockmeta_tx),
+                Arc::new(pumpfun_tx),
+                Arc::new(wallet_tx),
+                1000,
+            ).await;
+        });
     }
 
-    // 6) Manager PumpFun et ensemble des tokens créés
+    // 6) Manager PumpFun
     let manager = Arc::new(TokenWorkerManager::new(1_000));
     let created_tokens = Arc::new(DashMap::<String, ()>::new());
 
-    // 7.a) Consommation BlockMeta (simple log)
+    // 7.a) Lecture BlockMeta
     {
         tokio::spawn(async move {
             while let Ok(bm) = blockmeta_rx.recv_async().await {
@@ -66,23 +67,26 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 7.b) Consommation Wallet (simple log)
+    // 7.b) Lecture Wallet
     {
         tokio::spawn(async move {
             while let Ok(tx) = wallet_rx.recv_async().await {
-                info!("🟡 Wallet tx: {:?}", tx.transaction.as_ref().map(|info| info.signature.clone()));
+                let sig = tx.transaction
+                    .as_ref()
+                    .map(|info| info.signature.clone());
+                info!("🟡 Wallet tx: {:?}", sig);
             }
         });
     }
 
-    // 7.c) Consommation PumpFun (créations + trades) séquentielle
+    // 7.c) Lecture PumpFun (Create + Trade)
     {
         let manager = Arc::clone(&manager);
         let created_tokens = Arc::clone(&created_tokens);
         tokio::spawn(async move {
             while let Ok(tx) = pumpfun_rx.recv_async().await {
                 let slot = tx.slot;
-                // Récupère signature et index si dispo
+                // signature + index
                 let (tx_id, tx_index) = if let Some(info) = tx.transaction.as_ref() {
                     let sig = Signature::try_from(info.signature.clone())
                         .expect("invalid signature bytes");
@@ -91,21 +95,17 @@ async fn main() -> Result<()> {
                     continue;
                 };
 
-                // Parcours tous les logs encodés dans la tx
+                // decode logs
                 for raw in extract_program_logs(&tx) {
                     match decode_event(&raw) {
                         Ok(ParsedEvent::Create(evt)) => {
-                            // Création de token
                             let token_id = evt.mint.to_string();
                             info!("🆕 Token créé: {}", token_id);
-                            // Mémorise que ce token existe
                             created_tokens.insert(token_id.clone(), ());
-                            // Démarre le worker (task Tokio)
                             manager.ensure_worker(&token_id);
                         }
                         Ok(ParsedEvent::Trade(trade_evt)) => {
                             let token_id = trade_evt.mint.to_string();
-                            // Route un trade uniquement si le token a déjà été créé
                             if created_tokens.contains_key(&token_id) {
                                 let enriched = EnrichedTradeEvent {
                                     trade: trade_evt.clone(),
@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
                                     slot,
                                     tx_index,
                                 };
-                                // route_trade est async
+                                // envoi async au worker
                                 manager.route_trade(&token_id, enriched).await;
                             }
                         }
@@ -124,8 +124,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 8) Reste en vie jusqu'à Ctrl+C
+    // 8) Attente Ctrl+C
     signal::ctrl_c().await?;
-    info!("🛑 Arrêt demandé, shutdown…");
+    info!("🛑 Fin du bot");
     Ok(())
 }
