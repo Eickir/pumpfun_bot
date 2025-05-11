@@ -36,7 +36,7 @@ impl TokenWorkerManager {
             info!("🆕 Worker démarré pour token {}", token_clone);
             while let Some(trade) = rx.recv().await {
                 // TODO: remplacer par votre logique de traitement
-                info!("Trade reçu pour {}: {:?}", token_clone, trade);
+                // info!("Trade reçu pour {}: {:?}", token_clone, trade);
             }
             info!("🛑 Worker arrêté pour token {}", token_clone);
         });
