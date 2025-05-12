@@ -1,19 +1,20 @@
 use dotenv::dotenv;
-use std::{env, sync::Arc};
+use std::{env, sync::Arc, str::FromStr};
 use anyhow::Result;
 use tracing::{info, error};
-use tokio::{signal, sync::mpsc};
+use tokio::{signal, sync::mpsc, task};
 use futures_util::{stream::StreamExt};
 use tokio_stream::StreamMap;
 use futures_util::future::Either;
-use solana_sdk::signature::Signature;
+use solana_sdk::{hash::Hash, signature::Signature};
 use tokio_stream::wrappers::ReceiverStream;
 use solana_sdk::signer::keypair::Keypair;
+use dashmap::DashMap;
 use chrono::Local;
 use arc_swap::ArcSwap;
 use yellowstone_grpc_proto::prelude::{SubscribeUpdateBlockMeta, SubscribeUpdateTransaction};
 use solana_client::rpc_config::RpcSendTransactionConfig;
-use std::str::FromStr;
+
 mod modules;
 use crate::modules::{
     grpc_configuration::client::Client,
@@ -76,7 +77,7 @@ async fn main() -> Result<()> {
     let initial_meta = BlockMetaEntry {
         slot: 0,
         detected_at: Local::now(),
-        blockhash: Default::default(),
+        blockhash: Hash::default(),
     };
     let shared_blockmeta: SharedBlockMeta =
         Arc::new(ArcSwap::new(Arc::new(initial_meta)));
@@ -100,7 +101,7 @@ async fn main() -> Result<()> {
     {
         let shared    = Arc::clone(&shared_blockmeta);
         let manager   = Arc::new(TokenWorkerManager::new(1_000));
-        let created   = Arc::new(dashmap::DashMap::<String, ()>::new());
+        let created   = Arc::new(DashMap::<String, ()>::new());
         let wallet    = Arc::clone(&wallet);
         let rpc_conf  = rpc_config.clone();
 
@@ -114,9 +115,9 @@ async fn main() -> Result<()> {
 
                 async move {
                     match item {
-                        // Mise à jour de la dernière BlockMeta reçue
+                        // ** Mise à jour du dernier BlockMeta reçu **
                         Either::Left(bm_arc) => {
-                            if let Ok(h) = solana_sdk::hash::Hash::from_str(&bm_arc.blockhash) {
+                            if let Ok(h) = Hash::from_str(&bm_arc.blockhash) {
                                 let entry = BlockMetaEntry {
                                     slot:        bm_arc.slot,
                                     detected_at: Local::now(),
@@ -126,7 +127,7 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // Traitement des transactions PumpFun
+                        // ** Traitement des transactions PumpFun **
                         Either::Right(tx_arc) => {
                             let tx = &*tx_arc;
 
@@ -141,21 +142,30 @@ async fn main() -> Result<()> {
                                 return;
                             };
 
-                            // Décodage des logs
-                            let mut create_evt = None;
-                            let mut dev_trade  = None;
-                            let mut follow     = Vec::new();
-                            for raw in extract_program_logs(tx) {
-                                if let Ok(evt) = decode_event(&raw) {
-                                    match evt {
-                                        ParsedEvent::Create(e) => create_evt = Some(e),
-                                        ParsedEvent::Trade(e)  => {
-                                            dev_trade = Some(e.clone());
-                                            follow.push(e);
+                            // ** Décodage CPU-bound dans un pool blocking **
+                            let (create_evt, dev_trade, follow) = {
+                                // On clone les logs pour les déplacer dans la closure
+                                let logs = extract_program_logs(tx);
+                                task::spawn_blocking(move || {
+                                    let mut c = None;
+                                    let mut t = None;
+                                    let mut f = Vec::with_capacity(logs.len());
+                                    for raw in logs {
+                                        if let Ok(evt) = decode_event(&raw) {
+                                            match evt {
+                                                ParsedEvent::Create(e) => c = Some(e),
+                                                ParsedEvent::Trade(e)  => {
+                                                    t = Some(e.clone());
+                                                    f.push(e);
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                            }
+                                    (c, t, f)
+                                })
+                                .await
+                                .expect("panic dans spawn_blocking")
+                            };
 
                             // Buy dans la même slot
                             if let (Some(create), Some(trade)) = (create_evt, dev_trade) {
