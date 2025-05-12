@@ -1,20 +1,19 @@
 use dotenv::dotenv;
-use std::{env, sync::Arc, str::FromStr};
+use std::{env, sync::Arc};
 use anyhow::Result;
 use tracing::{info, error};
 use tokio::{signal, sync::mpsc};
 use futures_util::{stream::StreamExt};
 use tokio_stream::StreamMap;
 use futures_util::future::Either;
-use solana_sdk::{hash::Hash, signature::Signature};
+use solana_sdk::signature::Signature;
 use tokio_stream::wrappers::ReceiverStream;
 use solana_sdk::signer::keypair::Keypair;
-use dashmap::DashMap;
 use chrono::Local;
 use arc_swap::ArcSwap;
 use yellowstone_grpc_proto::prelude::{SubscribeUpdateBlockMeta, SubscribeUpdateTransaction};
 use solana_client::rpc_config::RpcSendTransactionConfig;
-
+use std::str::FromStr;
 mod modules;
 use crate::modules::{
     grpc_configuration::client::Client,
@@ -60,7 +59,7 @@ async fn main() -> Result<()> {
     let (pump_tx,      pump_rx)      = mpsc::channel::<Arc<SubscribeUpdateTransaction>>(1024);
     let (wallet_tx,    wallet_rx)    = mpsc::channel::<Arc<SubscribeUpdateTransaction>>(1024);
 
-    // 6) Lancement des deux flux gRPC en tâche de fond
+    // 6) Lancement des flux gRPC
     {
         let client    = Arc::clone(&client);
         let bm_chan   = Arc::new(blockmeta_tx);
@@ -73,19 +72,16 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 7) Stockage atomique du blockmeta pour fallback
+    // 7) Stockage atomique du dernier BlockMeta pour fallback
     let initial_meta = BlockMetaEntry {
         slot: 0,
         detected_at: Local::now(),
-        blockhash: Hash::default(),
+        blockhash: Default::default(),
     };
     let shared_blockmeta: SharedBlockMeta =
         Arc::new(ArcSwap::new(Arc::new(initial_meta)));
 
-    // 8) Cache slot → blockhash
-    let blockhash_cache = Arc::new(DashMap::<u64, Hash>::new());
-
-    // 9) Fusion des flux BlockMeta + PumpFun
+    // 8) Fusion des flux BlockMeta + PumpFun
     let mut sm = StreamMap::new();
     sm.insert(
         "bm",
@@ -100,18 +96,16 @@ async fn main() -> Result<()> {
             .boxed(),
     );
 
-    // 10) Traitement unifié
+    // 9) Traitement unifié
     {
-        let cache     = Arc::clone(&blockhash_cache);
         let shared    = Arc::clone(&shared_blockmeta);
         let manager   = Arc::new(TokenWorkerManager::new(1_000));
-        let created   = Arc::new(DashMap::<String, ()>::new());
+        let created   = Arc::new(dashmap::DashMap::<String, ()>::new());
         let wallet    = Arc::clone(&wallet);
         let rpc_conf  = rpc_config.clone();
 
         tokio::spawn(async move {
-            sm.for_each_concurrent(None, move |(_key, item)| {
-                let cache     = Arc::clone(&cache);
+            sm.for_each_concurrent(Some(1000), move |(_key, item)| {
                 let shared    = Arc::clone(&shared);
                 let manager   = Arc::clone(&manager);
                 let created   = Arc::clone(&created);
@@ -120,20 +114,24 @@ async fn main() -> Result<()> {
 
                 async move {
                     match item {
+                        // Mise à jour de la dernière BlockMeta reçue
                         Either::Left(bm_arc) => {
-                            if let Ok(h) = Hash::from_str(&bm_arc.blockhash) {
-                                cache.insert(bm_arc.slot, h);
+                            if let Ok(h) = solana_sdk::hash::Hash::from_str(&bm_arc.blockhash) {
+                                let entry = BlockMetaEntry {
+                                    slot:        bm_arc.slot,
+                                    detected_at: Local::now(),
+                                    blockhash:   h,
+                                };
+                                shared.store(Arc::new(entry));
                             }
                         }
+
+                        // Traitement des transactions PumpFun
                         Either::Right(tx_arc) => {
                             let tx = &*tx_arc;
-                            let slot = tx.slot;
 
-                            // Récupérez le blockhash pour ce slot
-                            let blockhash = cache
-                                .get(&slot)
-                                .map(|e| *e.value())
-                                .unwrap_or_else(|| shared.load().blockhash);
+                            // On récupère toujours le blockhash issu du dernier BlockMeta
+                            let blockhash = shared.load().blockhash;
 
                             // Signature + index
                             let (tx_id, tx_index) = if let Some(info) = tx.transaction.as_ref() {
@@ -143,7 +141,7 @@ async fn main() -> Result<()> {
                                 return;
                             };
 
-                            // Décoder logs en une seule passe
+                            // Décodage des logs
                             let mut create_evt = None;
                             let mut dev_trade  = None;
                             let mut follow     = Vec::new();
@@ -175,16 +173,27 @@ async fn main() -> Result<()> {
                                         .await
                                         .unwrap();
 
+                                    // On logge la signature avant envoi
+                                    let sig = buy_tx.signatures.get(0)
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| "<no-signature>".into());
+                                    info!("🛒 Envoi Buy tx (sig={})", sig);
+
+                                    // Envoi et log du résultat
                                     if let Err(e) = wallet
                                         .rpc_client
                                         .send_transaction_with_config(&buy_tx, rpc_conf).await
                                     {
-                                        error!("❌ Buy failed for {}: {:?}", token_id, e);
+                                        error!("❌ Buy failed for {} (sig={}): {:?}", token_id, sig, e);
                                         return;
+                                    } else {
+                                        info!("✅ Buy succeeded for {} (sig={})", token_id, sig);
                                     }
+
+                                    // Création du worker si nécessaire
                                     if created.insert(token_id.clone(), ()).is_none() {
                                         manager.ensure_worker(&token_id);
-                                        info!("🆕 Worker created for {}", token_id);
+                                        info!("🆕 Worker créé pour {}", token_id);
                                     }
                                 }
                             }
@@ -198,7 +207,7 @@ async fn main() -> Result<()> {
                                         EnrichedTradeEvent {
                                             trade:    e.clone(),
                                             tx_id:    tx_id.clone(),
-                                            slot,
+                                            slot:     tx.slot,
                                             tx_index,
                                         },
                                     )
@@ -213,7 +222,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 11) Log des tx de votre wallet
+    // 10) Log des tx de votre wallet
     {
         let mut ws = ReceiverStream::new(wallet_rx);
         tokio::spawn(async move {
@@ -223,7 +232,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 12) Shutdown propre
+    // 11) Shutdown propre
     signal::ctrl_c().await?;
     info!("🛑 Fin du bot");
     Ok(())
