@@ -3028,6 +3028,7 @@ dependencies = [
  "flume",
  "futures-util",
  "once_cell",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",

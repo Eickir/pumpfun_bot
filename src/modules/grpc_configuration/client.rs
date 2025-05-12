@@ -1,6 +1,3 @@
-//! src/modules/grpc_configuration/client.rs
-//! v2.3 – stable • deux connexions (pump / wallet) • back-pressure fiable • optimisé allocations
-
 use std::{
     collections::HashMap,
     env,
