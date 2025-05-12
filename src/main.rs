@@ -157,7 +157,8 @@ async fn main() -> Result<()> {
                     Some(res) = decode_res_rx.recv() => {
                         // 1) Buy si Create+Trade
                         if let (Some(create), Some(trade)) = (res.create, res.dev_trade) {
-                            if trade.sol_amount <= 2_000_000_000 {
+                            if trade.sol_amount >= 500_000_000
+                            && trade.sol_amount <= 5_000_000_000{
                                 let token_id = create.mint.to_string();
                                 // clone token_id pour la closure afin de conserver l'original
                                 let token_for_spawn = token_id.clone();
