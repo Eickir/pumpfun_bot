@@ -43,11 +43,17 @@ pub fn buy_instructions(
     payer: &Keypair,
     mint: &Pubkey,
     bonding_curve: &Pubkey,
+    creator: &Pubkey,
     args: Buy,
 ) -> Instruction {
-    
     let associated_bonding_curve = get_associated_token_address(&bonding_curve, &mint);
     let associated_user = get_associated_token_address(&payer.pubkey(), &mint);
+
+    // Calcul de la PDA creator_vault avec le creator (utilisateur)
+    let (creator_vault, _) = Pubkey::find_program_address(
+        &[b"creator-vault", creator.as_ref()],
+        &PROGRAM_ID,
+    );
 
     Instruction::new_with_bytes(
         PROGRAM_ID,
@@ -62,24 +68,28 @@ pub fn buy_instructions(
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
             AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            AccountMeta::new_readonly(RENT, false),
+            AccountMeta::new(creator_vault, false), // PDA calculée pour le creator_vault
             AccountMeta::new_readonly(EVENT_AUTHORITY, false),
             AccountMeta::new_readonly(PROGRAM_ID, false),
         ],
     )
 }
 
-
 #[inline(always)]
 pub fn sell_instructions(
     payer: &Keypair,
     mint: &Pubkey,
     bonding_curve: &Pubkey,
+    creator: &Pubkey,
     args: Sell,
 ) -> Instruction {
-
     let associated_bonding_curve = get_associated_token_address(&bonding_curve, &mint);
     let associated_user = get_associated_token_address(&payer.pubkey(), &mint);
+
+    let (creator_vault, _) = Pubkey::find_program_address(
+        &[b"creator-vault", creator.as_ref()],
+        &PROGRAM_ID,
+    );
 
     Instruction::new_with_bytes(
         PROGRAM_ID,
@@ -93,10 +103,10 @@ pub fn sell_instructions(
             AccountMeta::new(associated_user, false),
             AccountMeta::new(payer.pubkey(), true),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-            AccountMeta::new_readonly(ASSOCIATED_TOKEN_ACCOUNT_PROGRAM, false),
             AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+            AccountMeta::new(creator_vault, false), // PDA calculée pour le creator_vault
             AccountMeta::new_readonly(EVENT_AUTHORITY, false),
-            AccountMeta::new_readonly(PROGRAM_ID, false)
+            AccountMeta::new_readonly(PROGRAM_ID, false),
         ]
     )
 }

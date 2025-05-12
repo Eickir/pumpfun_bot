@@ -157,39 +157,41 @@ async fn main() -> Result<()> {
                     Some(res) = decode_res_rx.recv() => {
                         // 1) Buy si Create+Trade
                         if let (Some(create), Some(trade)) = (res.create, res.dev_trade) {
-                            if trade.sol_amount >= 500_000_000
-                            && trade.sol_amount <= 5_000_000_000{
+                            if trade.sol_amount >= 500_000_000 && trade.sol_amount <= 5_000_000_000 {
                                 let token_id = create.mint.to_string();
-                                // clone token_id pour la closure afin de conserver l'original
-                                let token_for_spawn = token_id.clone();
-                                let shared_hash     = shared.load().blockhash;
-                                let wallet2         = Arc::clone(&wallet);
+                                let token_id_cloned = Arc::new(token_id.clone()); // Cloner pour l'utiliser dans la tâche
+                                let shared_hash = shared.load().blockhash;
+                                let wallet2 = Arc::clone(&wallet);
                                 let rpc_conf2       = rpc_conf.clone();
-
-                                task::spawn(async move {
-                                    let buy_tx = wallet2
-                                        .buy_transaction(
-                                            &create.mint,
-                                            &create.bonding_curve,
-                                            0.001,
-                                            0.1,
-                                            trade,
-                                            shared_hash,
-                                        )
-                                        .await
-                                        .unwrap();
-                                    let sig = buy_tx.signatures[0];
-                                    match wallet2
-                                        .rpc_client
-                                        .send_transaction_with_config(&buy_tx, rpc_conf2)
-                                        .await
-                                    {
-                                        Ok(_) => info!("✅ Buy succeeded for {} (sig={})", token_for_spawn, sig),
-                                        Err(e) => error!("❌ Buy failed for {} (sig={}): {:?}", token_for_spawn, sig, e),
+                        
+                                task::spawn({
+                                    let token_id_cloned = Arc::clone(&token_id_cloned); // Cloner encore pour la tâche
+                                    async move {
+                                        let buy_tx = wallet2
+                                            .buy_transaction(
+                                                &create.mint,
+                                                &create.bonding_curve,
+                                                &create.user,
+                                                0.001,
+                                                0.1,
+                                                trade,
+                                                shared_hash,
+                                            )
+                                            .await
+                                            .unwrap();
+                                        let sig = buy_tx.signatures[0];
+                                        match wallet2
+                                            .rpc_client
+                                            .send_transaction_with_config(&buy_tx, rpc_conf2)
+                                            .await
+                                        {
+                                            Ok(_) => info!("✅ Buy succeeded for {} (sig={})", token_id_cloned, sig),
+                                            Err(e) => error!("❌ Buy failed for {} (sig={}): {:?}", token_id_cloned, sig, e),
+                                        }
                                     }
                                 });
-
-                                // utilisation de token_id ici encore
+                        
+                                // Utiliser `token_id` ici, en tant que variable indépendante
                                 if created.insert(token_id.clone(), ()).is_none() {
                                     manager.ensure_worker(&token_id);
                                 }
