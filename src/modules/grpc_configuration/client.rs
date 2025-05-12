@@ -1,53 +1,45 @@
-use solana_sdk::signer::Signer;
+// src/modules/grpc_configuration/client.rs
+
+use std::{collections::HashMap, sync::Arc, env};
+use solana_sdk::signer::{keypair::Keypair, Signer};
+use tokio::time::{sleep, Duration};
+use tokio::sync::mpsc::Sender;
 use tonic::transport::ClientTlsConfig;
+use tracing::{info, error};
+use futures_util::StreamExt;
 use yellowstone_grpc_client::{GeyserGrpcClient, Interceptor};
 use once_cell::sync::Lazy;
 use yellowstone_grpc_proto::prelude::*;
 use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
-use futures_util::StreamExt;
-use tracing::{error, info};
-use tonic::Status;
-use flume::Sender;
-use std::{collections::HashMap, sync::Arc};
-use tokio::time::{sleep, Duration};
-use std::env;
 
-// Vos constantes de configuration gRPC
+// vos constantes de configuration gRPC
 use crate::modules::grpc_configuration::constants::{
     CONNECT_TIMEOUT, REQUEST_TIMEOUT, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_TIMEOUT,
     MAX_MSG_SIZE, PUMPFUN_PROGRAM_ID,
 };
 
-// Cache TLS global pour gagner du temps à chaque connexion
+// TLS partagé pour éviter de récharger à chaque connexion
 static TLS_CONFIG: Lazy<ClientTlsConfig> =
     Lazy::new(|| ClientTlsConfig::new().with_native_roots());
 
-/// Groupe vos canaux pour ne cloner qu'un seul Arc par message
-struct TxChannels {
-    meta: Arc<Sender<SubscribeUpdateBlockMeta>>,
-    pump: Arc<Sender<SubscribeUpdateTransaction>>,
-    wallet: Arc<Sender<SubscribeUpdateTransaction>>,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct Client {
     endpoint: String,
     x_token: String,
-    subscribe_request: SubscribeRequest,
+    base_request: SubscribeRequest,
 }
 
 impl Client {
-    /// Crée un nouveau client et prépare la SubscribeRequest une fois pour toutes
     pub fn new(endpoint: String, x_token: String) -> anyhow::Result<Self> {
-        // Décodez votre clé une seule fois
-        let private_key_str = env::var("SOLANA_PRIVATE_KEY")?;
-        let keypair_bytes = bs58::decode(private_key_str).into_vec()?;
-        let pubkey = solana_sdk::signer::keypair::Keypair::from_bytes(&keypair_bytes)?.pubkey();
+        // charge et décode la clé une seule fois
+        let sk = env::var("SOLANA_PRIVATE_KEY")?;
+        let bytes = bs58::decode(sk).into_vec()?;
+        let pubkey = Keypair::from_bytes(&bytes)?.pubkey();
 
-        // Construisez votre map de filtres transactions
+        // construit le map `transactions`
         let mut transactions = HashMap::new();
         transactions.insert(
-            "pumpfun_listener".to_string(),
+            "pumpfun_listener".into(),
             SubscribeRequestFilterTransactions {
                 vote: None,
                 failed: Some(false),
@@ -58,7 +50,7 @@ impl Client {
             },
         );
         transactions.insert(
-            "my_wallet_transaction_listener".to_string(),
+            "my_wallet_transaction_listener".into(),
             SubscribeRequestFilterTransactions {
                 vote: None,
                 failed: None,
@@ -69,12 +61,11 @@ impl Client {
             },
         );
 
-        // Map pour le BlockMeta
+        // filtre pour les block meta
         let mut blocks_meta = HashMap::new();
-        blocks_meta.insert("block_listener".to_string(), SubscribeRequestFilterBlocksMeta {});
+        blocks_meta.insert("block_listener".into(), SubscribeRequestFilterBlocksMeta {});
 
-        // Préparez la requête complète
-        let subscribe_request = SubscribeRequest {
+        let base_request = SubscribeRequest {
             slots: HashMap::new(),
             accounts: HashMap::new(),
             transactions,
@@ -88,11 +79,10 @@ impl Client {
             from_slot: None,
         };
 
-        Ok(Self { endpoint, x_token, subscribe_request })
+        Ok(Self { endpoint, x_token, base_request })
     }
 
-    /// Établit la connexion gRPC
-    pub async fn connect(self: Arc<Self>) -> anyhow::Result<GeyserGrpcClient<impl Interceptor>> {
+    async fn connect(&self) -> anyhow::Result<GeyserGrpcClient<impl Interceptor>> {
         GeyserGrpcClient::build_from_shared(self.endpoint.clone())?
             .x_token(Some(self.x_token.clone()))?
             .connect_timeout(CONNECT_TIMEOUT)
@@ -102,89 +92,121 @@ impl Client {
             .keep_alive_timeout(KEEP_ALIVE_TIMEOUT)
             .tls_config((*TLS_CONFIG).clone())?
             .max_decoding_message_size(MAX_MSG_SIZE)
+            // ← Activation de TCP_NODELAY
+            .tcp_nodelay(true)
+            // ← Augmentation des fenêtres HTTP/2 pour réduire le buffering
+            .initial_stream_window_size(1 << 20)        // 1 MiB
+            .initial_connection_window_size(1 << 20)    // 1 MiB
             .connect()
             .await
             .map_err(Into::into)
     }
 
-    /// Boucle de reconnexion + traitement ultra-optimisé du flux gRPC
-    pub async fn subscribe_with_reconnect(
+    /// Ouvre deux flux gRPC en parallèle :
+    /// - pumpfun + blockmeta
+    /// - my_wallet_transaction
+    pub async fn subscribe_two_streams(
         self: Arc<Self>,
-        blockmeta_tx: Arc<Sender<SubscribeUpdateBlockMeta>>,
-        pumpfun_tx:   Arc<Sender<SubscribeUpdateTransaction>>,
-        wallet_tx:    Arc<Sender<SubscribeUpdateTransaction>>,
+        blockmeta_tx: Arc<Sender<Arc<SubscribeUpdateBlockMeta>>>,
+        pump_tx: Arc<Sender<Arc<SubscribeUpdateTransaction>>>,
+        wallet_tx: Arc<Sender<Arc<SubscribeUpdateTransaction>>>,
         concurrency_limit: usize,
     ) {
-        // Regroupez vos canaux pour un seul clone d'Arc
-        let txs = Arc::new(TxChannels {
-            meta: blockmeta_tx,
-            pump: pumpfun_tx,
-            wallet: wallet_tx,
-        });
+        // prépare deux requêtes filtrées
+        let mut pump_req = self.base_request.clone();
+        pump_req.transactions.retain(|k, _| k == "pumpfun_listener");
+        // on garde blockmeta pour pump_req
 
-        loop {
-            match Arc::clone(&self).connect().await {
-                Ok(mut client) => {
-                    info!("✅ Connected to gRPC server.");
-                    // Réutilisez la même requête à chaque reconnexion
-                    let req = self.subscribe_request.clone();
-                    match client.subscribe_with_request(Some(req)).await {
-                        Ok((_sink, stream)) => {
-                            info!("📡 Subscribed to gRPC stream.");
+        let mut wallet_req = self.base_request.clone();
+        wallet_req.transactions.retain(|k, _| k == "my_wallet_transaction_listener");
+        wallet_req.blocks_meta = HashMap::new(); // plus de blockmeta pour wallet
 
-                            stream
-                                // 1) Inspect synchronously pour les BlockMeta (pas de clone lourd)
-                                .inspect(|maybe_update| {
-                                    if let Ok(update) = maybe_update {
-                                        if let Some(UpdateOneof::BlockMeta(bm)) = &update.update_oneof {
-                                            // try_send non-bloquant
-                                            let _ = txs.meta.try_send(bm.clone());
-                                        }
-                                    }
-                                })
-                                // 2) Ne gardez que les transactions à router, taguées wallet ou pump
-                                .filter_map(|res| {
-                                    let txs = Arc::clone(&txs);
-                                    async move {
-                                        match res {
-                                            Ok(update) => {
-                                                if let Some(UpdateOneof::Transaction(tx)) = update.update_oneof {
-                                                    let is_wallet = update
-                                                        .filters
-                                                        .iter()
-                                                        .any(|f| f == "my_wallet_transaction_listener");
-                                                    Some((is_wallet, tx))
-                                                } else {
-                                                    None
+        let svc = Arc::clone(&self);
+
+        // flux pumpfun + blockmeta
+        {
+            let svc = Arc::clone(&svc);
+            let pump_req = pump_req.clone();
+            let blockmeta_tx = Arc::clone(&blockmeta_tx);
+            let pump_tx = Arc::clone(&pump_tx);
+
+            tokio::spawn(async move {
+                loop {
+                    match svc.connect().await {
+                        Ok(mut client) => {
+                            if let Ok((_sink, mut stream)) =
+                                client.subscribe_with_request(Some(pump_req.clone())).await
+                            {
+                                info!("📡 pumpfun stream subscribed");
+                                stream
+                                    .for_each_concurrent(concurrency_limit, |res| {
+                                        let blockmeta_tx = Arc::clone(&blockmeta_tx);
+                                        let pump_tx = Arc::clone(&pump_tx);
+                                        async move {
+                                            if let Ok(update) = res {
+                                                // emprunt pour BlockMeta
+                                                if let Some(UpdateOneof::BlockMeta(bm)) =
+                                                    update.update_oneof.as_ref()
+                                                {
+                                                    let _ = blockmeta_tx
+                                                        .try_send(Arc::new(bm.clone()));
+                                                }
+                                                // emprunt pour Transaction
+                                                if let Some(UpdateOneof::Transaction(tx)) =
+                                                    update.update_oneof.as_ref()
+                                                {
+                                                    let _ = pump_tx
+                                                        .try_send(Arc::new(tx.clone()));
                                                 }
                                             }
-                                            Err(err) => {
-                                                error!("🔴 gRPC stream error: {:?}", err);
-                                                None
+                                        }
+                                    })
+                                    .await;
+                            }
+                        }
+                        Err(err) => error!("pumpfun connect failed: {}", err),
+                    }
+                    sleep(Duration::from_secs(5)).await;
+                }
+            });
+        }
+
+        // flux wallet
+        {
+            let svc = Arc::clone(&svc);
+            let wallet_req = wallet_req.clone();
+            let wallet_tx = Arc::clone(&wallet_tx);
+
+            tokio::spawn(async move {
+                loop {
+                    match svc.connect().await {
+                        Ok(mut client) => {
+                            if let Ok((_sink, mut stream)) =
+                                client.subscribe_with_request(Some(wallet_req.clone())).await
+                            {
+                                info!("📡 wallet stream subscribed");
+                                stream
+                                    .for_each_concurrent(concurrency_limit, |res| {
+                                        let wallet_tx = Arc::clone(&wallet_tx);
+                                        async move {
+                                            if let Ok(update) = res {
+                                                if let Some(UpdateOneof::Transaction(tx)) =
+                                                    update.update_oneof.as_ref()
+                                                {
+                                                    let _ = wallet_tx
+                                                        .try_send(Arc::new(tx.clone()));
+                                                }
                                             }
                                         }
-                                    }
-                                })
-                                // 3) Routez en mémoire en parallèle jusqu'à concurrence_limit
-                                .for_each_concurrent(concurrency_limit, |(is_wallet, tx)| {
-                                    let txs = Arc::clone(&txs);
-                                    async move {
-                                        if is_wallet {
-                                            let _ = txs.wallet.try_send(tx);
-                                        } else {
-                                            let _ = txs.pump.try_send(tx);
-                                        }
-                                    }
-                                })
-                                .await;
+                                    })
+                                    .await;
+                            }
                         }
-                        Err(err) => error!("❌ Subscription failed: {}", err),
+                        Err(err) => error!("wallet connect failed: {}", err),
                     }
+                    sleep(Duration::from_secs(5)).await;
                 }
-                Err(err) => error!("❌ Connection failed: {}", err),
-            }
-            info!("⏳ Reconnecting in 5 seconds…");
-            sleep(Duration::from_secs(5)).await;
+            });
         }
     }
 }

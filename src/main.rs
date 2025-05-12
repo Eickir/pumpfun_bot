@@ -1,13 +1,16 @@
 use dotenv::dotenv;
-use std::{env, sync::Arc};
+use std::{env, sync::Arc, str::FromStr};
 use anyhow::Result;
 use tracing::{info, error};
-use tokio::signal;
-use solana_sdk::{hash::Hash, signature::Signature, signer::Signer};
+use tokio::{signal, sync::mpsc};
+use futures_util::{stream::StreamExt};
+use tokio_stream::StreamMap;
+use futures_util::future::Either;
+use solana_sdk::{hash::Hash, signature::Signature};
+use tokio_stream::wrappers::ReceiverStream;
 use solana_sdk::signer::keypair::Keypair;
 use dashmap::DashMap;
-use flume::Receiver;
-use chrono::{Local};
+use chrono::Local;
 use arc_swap::ArcSwap;
 use yellowstone_grpc_proto::prelude::{SubscribeUpdateBlockMeta, SubscribeUpdateTransaction};
 use solana_client::rpc_config::RpcSendTransactionConfig;
@@ -18,7 +21,7 @@ use crate::modules::{
     token_manager::token_manager::TokenWorkerManager,
     utils::decoder::{extract_program_logs, decode_event},
     utils::types::{ParsedEvent, EnrichedTradeEvent},
-    utils::blockmeta_handler::{BlockMetaEntry, SharedBlockMeta, spawn_blockmeta_data},
+    utils::blockmeta_handler::{BlockMetaEntry, SharedBlockMeta},
     wallet::wallet::Wallet,
 };
 
@@ -28,161 +31,194 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().init();
     dotenv().ok();
 
-    // 2) Config RPC Solana
-    let config = RpcSendTransactionConfig {
+    // 2) RPC Solana config
+    let rpc_config = RpcSendTransactionConfig {
         skip_preflight: true,
         preflight_commitment: None,
         max_retries: Some(0),
         encoding: None,
         min_context_slot: None,
     };
-
     info!("🚀 Démarrage du bot gRPC…");
 
-    // 3) Wallet
-    let private_key_str = env::var("SOLANA_PRIVATE_KEY")?;
-    let keypair_bytes = bs58::decode(private_key_str).into_vec()?;
-    let keypair = Keypair::from_bytes(&keypair_bytes)?;
+    // 3) Wallet setup
+    let sk = env::var("SOLANA_PRIVATE_KEY")?;
+    let bytes = bs58::decode(sk).into_vec()?;
+    let keypair = Keypair::from_bytes(&bytes)?;
     let rpc_url = env::var("RPC_ENDPOINT")?;
     let wallet = Arc::new(Wallet::new(keypair, &rpc_url));
     let balance = wallet.get_balance().await.unwrap();
-    info!(
-        "Wallet connecté, SOL disponible: {}",
-        balance as f64 / 1_000_000_000.0
-    );
+    info!("Wallet connecté, SOL disponible : {}", balance as f64 / 1e9);
 
-    // 4) gRPC client : prépare aussi la SubscribeRequest
+    // 4) gRPC client
     let endpoint = env::var("GRPC_ENDPOINT")?;
-    let x_token = env::var("X_TOKEN")?;
-    let client = Arc::new(Client::new(endpoint, x_token)?);
+    let x_token  = env::var("X_TOKEN")?;
+    let client   = Arc::new(Client::new(endpoint, x_token)?);
 
-    // 5) Canaux Flume pour blockmeta & tx
-    let (blockmeta_tx, blockmeta_rx) = flume::unbounded::<SubscribeUpdateBlockMeta>();
-    let (pumpfun_tx, pumpfun_rx) = flume::unbounded::<SubscribeUpdateTransaction>();
-    let (wallet_tx, wallet_rx) = flume::unbounded::<SubscribeUpdateTransaction>();
+    // 5) Canaux Tokio MPSC (zero-copy via Arc)
+    let (blockmeta_tx, blockmeta_rx) = mpsc::channel::<Arc<SubscribeUpdateBlockMeta>>(1024);
+    let (pump_tx,      pump_rx)      = mpsc::channel::<Arc<SubscribeUpdateTransaction>>(1024);
+    let (wallet_tx,    wallet_rx)    = mpsc::channel::<Arc<SubscribeUpdateTransaction>>(1024);
 
-    // 6) Lancement de la souscription gRPC en tâche de fond
+    // 6) Lancement des deux flux gRPC en tâche de fond
     {
-        let client = Arc::clone(&client);
+        let client    = Arc::clone(&client);
+        let bm_chan   = Arc::new(blockmeta_tx);
+        let pump_chan = Arc::new(pump_tx);
+        let wal_chan  = Arc::new(wallet_tx);
         tokio::spawn(async move {
             client
-                .subscribe_with_reconnect(
-                    Arc::new(blockmeta_tx),
-                    Arc::new(pumpfun_tx),
-                    Arc::new(wallet_tx),
-                    1000, // concurrency_limit
-                )
+                .subscribe_two_streams(bm_chan, pump_chan, wal_chan, 2000)
                 .await;
         });
     }
 
-    // 7) Stockage atomique du blockmeta
+    // 7) Stockage atomique du blockmeta pour fallback
     let initial_meta = BlockMetaEntry {
         slot: 0,
         detected_at: Local::now(),
         blockhash: Hash::default(),
     };
-    let shared_blockmeta: SharedBlockMeta = Arc::new(ArcSwap::new(Arc::new(initial_meta)));
+    let shared_blockmeta: SharedBlockMeta =
+        Arc::new(ArcSwap::new(Arc::new(initial_meta)));
 
-    // 8) Tâche de persistance blockmeta
+    // 8) Cache slot → blockhash
+    let blockhash_cache = Arc::new(DashMap::<u64, Hash>::new());
+
+    // 9) Fusion des flux BlockMeta + PumpFun
+    let mut sm = StreamMap::new();
+    sm.insert(
+        "bm",
+        ReceiverStream::new(blockmeta_rx)
+            .map(Either::Left)
+            .boxed(),
+    );
+    sm.insert(
+        "pu",
+        ReceiverStream::new(pump_rx)
+            .map(Either::Right)
+            .boxed(),
+    );
+
+    // 10) Traitement unifié
     {
-        let storage = Arc::clone(&shared_blockmeta);
-        tokio::spawn(async move {
-            spawn_blockmeta_data(blockmeta_rx, storage).await;
-        });
-    }
-
-    // 9) Manager PumpFun
-    let manager = Arc::new(TokenWorkerManager::new(1_000));
-    let created_tokens = Arc::new(DashMap::<String, ()>::new());
-
-    // 10) Log des tx de mon wallet
-    {
-        tokio::spawn(async move {
-            while let Ok(tx) = wallet_rx.recv_async().await {
-                info!("🟡 Wallet tx: {:?}", tx);
-            }
-        });
-    }
-
-    // 11) Traitement PumpFun (Create + Trade) par worker
-    {
-        let manager = Arc::clone(&manager);
-        let created_tokens = Arc::clone(&created_tokens);
-        let shared_blockmeta = Arc::clone(&shared_blockmeta);
-        let wallet = Arc::clone(&wallet);
+        let cache     = Arc::clone(&blockhash_cache);
+        let shared    = Arc::clone(&shared_blockmeta);
+        let manager   = Arc::new(TokenWorkerManager::new(1_000));
+        let created   = Arc::new(DashMap::<String, ()>::new());
+        let wallet    = Arc::clone(&wallet);
+        let rpc_conf  = rpc_config.clone();
 
         tokio::spawn(async move {
-            while let Ok(tx) = pumpfun_rx.recv_async().await {
-                let slot = tx.slot;
-                // signature + index
-                let (tx_id, tx_index) = if let Some(info) = tx.transaction.as_ref() {
-                    let sig = Signature::try_from(info.signature.clone()).unwrap();
-                    (sig, info.index)
-                } else {
-                    continue;
-                };
+            sm.for_each_concurrent(None, move |(_key, item)| {
+                let cache     = Arc::clone(&cache);
+                let shared    = Arc::clone(&shared);
+                let manager   = Arc::clone(&manager);
+                let created   = Arc::clone(&created);
+                let wallet    = Arc::clone(&wallet);
+                let rpc_conf  = rpc_conf.clone();
 
-                // blockhash à jour
-                let recent_blockhash = shared_blockmeta.load().blockhash;
-
-                // 1) détection Create + Trade du dev
-                let mut maybe_create = None;
-                let mut maybe_dev_trade = None;
-                for raw in extract_program_logs(&tx) {
-                    match decode_event(&raw) {
-                        Ok(ParsedEvent::Create(evt)) => maybe_create = Some(evt.clone()),
-                        Ok(ParsedEvent::Trade(evt)) => maybe_dev_trade = Some(evt.clone()),
-                        _ => {}
-                    }
-                }
-
-                // 2) Buy si ready
-                if let (Some(create_evt), Some(trade_evt)) = (maybe_create, maybe_dev_trade) {
-                    if trade_evt.sol_amount <= 2_000_000_000 {
-                        let token_id = create_evt.mint.to_string();
-                        let tx = wallet
-                            .buy_transaction(
-                                &create_evt.mint,
-                                &create_evt.bonding_curve,
-                                0.001,
-                                0.1,
-                                trade_evt.clone(),
-                                recent_blockhash,
-                            )
-                            .await
-                            .unwrap();
-
-                        match wallet.rpc_client.send_transaction_with_config(&tx, config).await {
-                            Ok(sig) => info!("✅ Buy tx pour {}: {:?}", token_id, sig),
-                            Err(e) => {
-                                error!("❌ Échec du buy pour {}: {:?}", token_id, e);
-                                continue;
+                async move {
+                    match item {
+                        Either::Left(bm_arc) => {
+                            if let Ok(h) = Hash::from_str(&bm_arc.blockhash) {
+                                cache.insert(bm_arc.slot, h);
                             }
                         }
+                        Either::Right(tx_arc) => {
+                            let tx = &*tx_arc;
+                            let slot = tx.slot;
 
-                        if created_tokens.insert(token_id.clone(), ()).is_none() {
-                            manager.ensure_worker(&token_id);
-                            info!("🆕 Worker créé pour {}", token_id);
-                        }
-                    }
-                }
+                            // Récupérez le blockhash pour ce slot
+                            let blockhash = cache
+                                .get(&slot)
+                                .map(|e| *e.value())
+                                .unwrap_or_else(|| shared.load().blockhash);
 
-                // 3) Routage des trades suivants
-                for raw in extract_program_logs(&tx) {
-                    if let Ok(ParsedEvent::Trade(evt)) = decode_event(&raw) {
-                        let token_id = evt.mint.to_string();
-                        if created_tokens.contains_key(&token_id) {
-                            let enriched = EnrichedTradeEvent {
-                                trade: evt.clone(),
-                                tx_id: tx_id.clone(),
-                                slot,
-                                tx_index,
+                            // Signature + index
+                            let (tx_id, tx_index) = if let Some(info) = tx.transaction.as_ref() {
+                                let sig = Signature::try_from(info.signature.clone()).unwrap();
+                                (sig, info.index)
+                            } else {
+                                return;
                             };
-                            manager.route_trade(&token_id, enriched).await;
+
+                            // Décoder logs en une seule passe
+                            let mut create_evt = None;
+                            let mut dev_trade  = None;
+                            let mut follow     = Vec::new();
+                            for raw in extract_program_logs(tx) {
+                                if let Ok(evt) = decode_event(&raw) {
+                                    match evt {
+                                        ParsedEvent::Create(e) => create_evt = Some(e),
+                                        ParsedEvent::Trade(e)  => {
+                                            dev_trade = Some(e.clone());
+                                            follow.push(e);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Buy dans la même slot
+                            if let (Some(create), Some(trade)) = (create_evt, dev_trade) {
+                                if trade.sol_amount <= 2_000_000_000 {
+                                    let token_id = create.mint.to_string();
+                                    let buy_tx = wallet
+                                        .buy_transaction(
+                                            &create.mint,
+                                            &create.bonding_curve,
+                                            0.001,
+                                            0.1,
+                                            trade.clone(),
+                                            blockhash,
+                                        )
+                                        .await
+                                        .unwrap();
+
+                                    if let Err(e) = wallet
+                                        .rpc_client
+                                        .send_transaction_with_config(&buy_tx, rpc_conf).await
+                                    {
+                                        error!("❌ Buy failed for {}: {:?}", token_id, e);
+                                        return;
+                                    }
+                                    if created.insert(token_id.clone(), ()).is_none() {
+                                        manager.ensure_worker(&token_id);
+                                        info!("🆕 Worker created for {}", token_id);
+                                    }
+                                }
+                            }
+
+                            // Routage des trades suivants
+                            for e in follow {
+                                let tid = e.mint.to_string();
+                                if created.contains_key(&tid) {
+                                    manager.route_trade(
+                                        &tid,
+                                        EnrichedTradeEvent {
+                                            trade:    e.clone(),
+                                            tx_id:    tx_id.clone(),
+                                            slot,
+                                            tx_index,
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                     }
                 }
+            })
+            .await;
+        });
+    }
+
+    // 11) Log des tx de votre wallet
+    {
+        let mut ws = ReceiverStream::new(wallet_rx);
+        tokio::spawn(async move {
+            while let Some(tx_arc) = ws.next().await {
+                info!("🟡 Wallet tx: {:?}", tx_arc);
             }
         });
     }
