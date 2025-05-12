@@ -25,25 +25,25 @@ use solana_program::message::v0;
 /// The main Wallet struct. Note how keypair is wrapped in `Arc<Keypair>`.
 #[derive(Clone)]
 pub struct Wallet {
-    /// Use Arc so we can safely clone references without copying secret key data.
-    pub keypair: Arc<Keypair>,
-    pub pubkey: Pubkey,
+    pub keypair:    Arc<Keypair>,
+    pub pubkey:     Pubkey,
     pub rpc_client: Arc<RpcClient>,
+    compute_budget_ix: Instruction,
 }
 
 impl Wallet {
-    /// Construct a new Wallet, storing the keypair in an Arc.
     pub fn new(keypair: Keypair, rpc_url: &str) -> Self {
         let rpc_client = Arc::new(RpcClient::new_with_commitment(
             rpc_url.to_string(),
             CommitmentConfig::processed(),
         ));
         let pubkey = keypair.pubkey();
-
+        let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_price(100_000);
         Self {
-            keypair:Arc::new(keypair),
+            keypair:    Arc::new(keypair),
             pubkey,
-            rpc_client
+            rpc_client,
+            compute_budget_ix
         }
     }
 
@@ -64,8 +64,8 @@ impl Wallet {
         blockhash: Hash,
     ) -> Result<VersionedTransaction, Box<dyn Error + Send + Sync>> {
     
-        let mut instructions: Vec<Instruction> = vec![];
-        instructions.push(ComputeBudgetInstruction::set_compute_unit_price(100_000));
+        let mut instructions = Vec::with_capacity(3);
+        instructions.push(self.compute_budget_ix.clone());
     
         instructions.push(create_associated_token_account(
             &self.pubkey,
@@ -82,7 +82,7 @@ impl Wallet {
         );
     
         instructions.push(buy_instructions(
-            &self.keypair, 
+            &self.pubkey, 
             &mint, 
             &bonding_curve, 
             &creator, 
@@ -107,13 +107,13 @@ impl Wallet {
         blockhash: Hash,
     ) -> Result<VersionedTransaction, Box<dyn Error + Send + Sync>> {
 
-        let mut instructions: Vec<Instruction> = vec![];
+        let mut instructions = Vec::with_capacity(3);
 
         // priority fee 
-        instructions.push(ComputeBudgetInstruction::set_compute_unit_price(100_000));
+        instructions.push(self.compute_budget_ix.clone());
 
         // sell instructions 
-        instructions.push(sell_instructions(&self.keypair, &mint, &bonding_curve, &creator, Sell {_amount: token_amount,   _min_sol_output: 0}));
+        instructions.push(sell_instructions(&self.pubkey, &mint, &bonding_curve, &creator, Sell {_amount: token_amount,   _min_sol_output: 0}));
 
         // close associated token account
         let associated_user = get_associated_token_address(&self.pubkey, &mint);

@@ -40,14 +40,14 @@ pub fn buy_instructions_arguments(
 
 #[inline(always)]
 pub fn buy_instructions(
-    payer: &Keypair,
+    payer: &Pubkey,
     mint: &Pubkey,
     bonding_curve: &Pubkey,
     creator: &Pubkey,
     args: Buy,
 ) -> Instruction {
     let associated_bonding_curve = get_associated_token_address(&bonding_curve, &mint);
-    let associated_user = get_associated_token_address(&payer.pubkey(), &mint);
+    let associated_user = get_associated_token_address(&payer, &mint);
 
     // Calcul de la PDA creator_vault avec le creator (utilisateur)
     let (creator_vault, _) = Pubkey::find_program_address(
@@ -65,7 +65,7 @@ pub fn buy_instructions(
             AccountMeta::new(*bonding_curve, false),
             AccountMeta::new(associated_bonding_curve, false),
             AccountMeta::new(associated_user, false),
-            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(*payer, true),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
             AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             AccountMeta::new(creator_vault, false), // PDA calculée pour le creator_vault
@@ -77,14 +77,14 @@ pub fn buy_instructions(
 
 #[inline(always)]
 pub fn sell_instructions(
-    payer: &Keypair,
+    payer: &Pubkey,
     mint: &Pubkey,
     bonding_curve: &Pubkey,
     creator: &Pubkey,
     args: Sell,
 ) -> Instruction {
     let associated_bonding_curve = get_associated_token_address(&bonding_curve, &mint);
-    let associated_user = get_associated_token_address(&payer.pubkey(), &mint);
+    let associated_user = get_associated_token_address(&payer, &mint);
 
     let (creator_vault, _) = Pubkey::find_program_address(
         &[b"creator-vault", creator.as_ref()],
@@ -101,7 +101,7 @@ pub fn sell_instructions(
             AccountMeta::new(*bonding_curve, false),
             AccountMeta::new(associated_bonding_curve, false),
             AccountMeta::new(associated_user, false),
-            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(*payer, true),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
             AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             AccountMeta::new(creator_vault, false), // PDA calculée pour le creator_vault
