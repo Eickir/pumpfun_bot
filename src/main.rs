@@ -243,9 +243,8 @@ async fn main() -> Result<()> {
                             dev_trade.virtual_sol_reserves,
                             dev_trade.virtual_token_reserves
                         );
-                        info!("📌 MC achat {mint}: {:.2} SOL", buy_mc);
 
-                        created_c.insert(mint, MintState { create: create_evt.clone(), buy_mc, confirmed: false });
+                        created_c.insert(mint, MintState { create: create_evt.clone(), buy_mc: 0.0, confirmed: false });
 
                         // spawn l'achat
                         let wallet_b  = Arc::clone(&wallet_c);
@@ -285,9 +284,18 @@ async fn main() -> Result<()> {
                                     }
                                     while rx.changed().await.is_ok() {
                                         if *rx.borrow() == TxStatus::Successed {
-                                            info!("✅ Buy confirmé {mint}");
-                                            if let Some(mut s) = created_b.get_mut(&mint) {
-                                                s.confirmed = true;
+                                            if let Some(conf) = pending_b.get(&sig) {
+                                                let real_mc = market_cap(
+                                                    conf.virtual_sol_reserves,
+                                                    conf.virtual_token_reserves,
+                                                );
+                                                info!("✅ Buy confirmé {mint} – MC entrée ≈ {:.2} SOL", real_mc);
+                                    
+                                                // mettre à jour l’état du mint
+                                                if let Some(mut st) = created_b.get_mut(&mint) {
+                                                    st.buy_mc   = real_mc;
+                                                    st.confirmed = true;
+                                                }
                                             }
                                             manager_b.ensure_worker(&mint.to_string());
                                             break;
