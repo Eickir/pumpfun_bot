@@ -1,18 +1,18 @@
-//! src/main.rs – v3.2  (intégration : vérification directe du flux wallet)
+//! src/main.rs – v3.6  (shutdown propre, Rayon stoppé, gestion correcte des JoinHandle)
 
 use dotenv::dotenv;
 use std::{
     env,
     str::FromStr,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
 };
 
 use anyhow::Result;
 use dashmap::DashMap;
-use flume::{bounded as flume_bounded, Receiver as FlumeReceiver, Sender as FlumeSender}; // ← utilisé seulement pour Rayon
+use flume::{bounded as flume_bounded, Receiver as FlumeReceiver, Sender as FlumeSender};
 use rayon::{iter::ParallelBridge, prelude::*};
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_sdk::{
@@ -24,7 +24,10 @@ use solana_sdk::{
 use tokio::{
     signal,
     sync::{mpsc, watch, Semaphore},
+    task::JoinHandle,
+    time::{sleep, timeout, Duration},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 mod modules;
@@ -64,11 +67,15 @@ struct DecodeResult {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // ─────────────── Init & cancellation token ────────────────
     dotenv().ok();
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
     info!("🚀 Bot Pump.fun lancé");
 
-    // ───────────────────────── 1. Config & Wallet ──────────────────────────
+    let shutdown = CancellationToken::new();
+    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+
+    // ─────────────── 1. Config & Wallet ───────────────────────
     let rpc_cfg = RpcSendTransactionConfig {
         skip_preflight: true,
         preflight_commitment: None,
@@ -77,24 +84,26 @@ async fn main() -> Result<()> {
         min_context_slot: None,
     };
 
-    let keypair =
-        Keypair::from_bytes(&bs58::decode(env::var("SOLANA_PRIVATE_KEY")?).into_vec()?)?;
+    let keypair = Keypair::from_bytes(
+        &bs58::decode(env::var("SOLANA_PRIVATE_KEY")?).into_vec()?,
+    )?;
     let wallet = Arc::new(Wallet::new(keypair, &env::var("RPC_ENDPOINT")?));
     let balance = wallet.get_balance().await.unwrap();
     let wallet_balance = Arc::new(AtomicU64::new(balance));
     info!("✅ Solde: {:.4} SOL", balance as f64 / 1e9);
 
-    // ───────────────────────── 2. Maps partagées ──────────────────────────
-    let pending: PendingTxMap = Arc::new(DashMap::new());          // tx en attente
-    let created: DashMap<Pubkey, ()> = DashMap::with_capacity(8_192);
+    // ─────────────── 2. Maps partagées ────────────────────────
+    let pending: PendingTxMap = Arc::new(DashMap::new());
+    let created: Arc<DashMap<Pubkey, ()>> =
+        Arc::new(DashMap::with_capacity(8_192));
 
-    // ───────────────────────── 3. gRPC Client ─────────────────────────────
+    // ─────────────── 3. gRPC Client ───────────────────────────
     let client = Arc::new(Client::new(
         env::var("GRPC_ENDPOINT")?,
         env::var("X_TOKEN")?,
     )?);
 
-    // ───────────────────────── 4. Canaux Tokio ────────────────────────────
+    // ─────────────── 4. Canaux Tokio ─────────────────────────
     let (blockmeta_tx, mut blockmeta_rx) =
         mpsc::channel::<Arc<SubscribeUpdateBlockMeta>>(1024);
     let (pump_tx, mut pump_rx) =
@@ -102,12 +111,13 @@ async fn main() -> Result<()> {
     let (wallet_tx, wallet_rx) =
         mpsc::channel::<Arc<SubscribeUpdateTransaction>>(1024);
 
-    let (decode_res_tx, mut decode_res_rx) = mpsc::channel::<DecodeResult>(1024);
+    let (decode_res_tx, mut decode_res_rx) =
+        mpsc::channel::<DecodeResult>(1024);
 
-    // ───────────────────────── 5. Streams Yellowstone ─────────────────────
+    // ─────────────── 5. Streams Yellowstone ──────────────────
     {
         let cli = Arc::clone(&client);
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             cli.subscribe_two_streams(
                 Arc::new(blockmeta_tx),
                 Arc::new(pump_tx),
@@ -115,73 +125,81 @@ async fn main() -> Result<()> {
                 512,
             )
             .await;
-        });
+        }));
     }
 
-    // ───────────────────────── 6. Blockhash watch ─────────────────────────
+    // ─────────────── 6. Blockhash watch ──────────────────────
     let (bh_tx, bh_rx) = watch::channel(Hash::default());
     let last_slot = Arc::new(AtomicU64::new(0));
 
-    // ───────────────────────── 7. Rayon decode pool ───────────────────────
-    let (decode_req_tx, decode_req_rx): (FlumeSender<DecodeJob>, FlumeReceiver<DecodeJob>) =
+    // ─────────────── 7. Rayon decode pool ────────────────────
+    let (decode_req_tx, decode_req_rx): (FlumeSender<DecodeJob>, FlumeReceiver<
+        DecodeJob,
+    >) =
         flume_bounded(4_096);
     {
         let out = decode_res_tx.clone();
         rayon::spawn_fifo(move || {
-            decode_req_rx
-                .into_iter()
-                .par_bridge()
-                .for_each(|job| {
-                    let mut create = None;
-                    let mut dev = None;
-                    let mut follow = Vec::with_capacity(job.logs.len());
+            decode_req_rx.into_iter().par_bridge().for_each(|job| {
+                let mut create = None;
+                let mut dev = None;
+                let mut follow = Vec::with_capacity(job.logs.len());
 
-                    for raw in &job.logs {
-                        if let Ok(evt) = decode_event(raw) {
-                            match evt {
-                                ParsedEvent::Create(e) => create = Some(e),
-                                ParsedEvent::Trade(e) => {
-                                    dev = Some(e.clone());
-                                    follow.push(e);
-                                }
+                for raw in &job.logs {
+                    if let Ok(evt) = decode_event(raw) {
+                        match evt {
+                            ParsedEvent::Create(e) => create = Some(e),
+                            ParsedEvent::Trade(e) => {
+                                dev = Some(e.clone());
+                                follow.push(e);
                             }
                         }
                     }
+                }
 
-                    let _ = out.try_send(DecodeResult {
-                        slot: job.slot,
-                        tx_id: job.tx_id,
-                        tx_index: job.tx_index,
-                        create,
-                        dev_trade: dev,
-                        follow,
-                    });
+                let _ = out.try_send(DecodeResult {
+                    slot: job.slot,
+                    tx_id: job.tx_id,
+                    tx_index: job.tx_index,
+                    create,
+                    dev_trade: dev,
+                    follow,
                 });
+            });
         });
     }
 
-    // ───────────────────────── 8. Autres partagés ─────────────────────────
+    // ─────────────── 8. Autres partagés ───────────────────────
     let manager = Arc::new(TokenWorkerManager::new(1_000));
     let buy_sem = Arc::new(Semaphore::const_new(128));
 
-    // ───────────────────────── 9. Vérificateur wallet ─────────────────────
+    // ─────────────── 9. Vérificateur wallet ──────────────────
     {
         let pend = Arc::clone(&pending);
         let bal = Arc::clone(&wallet_balance);
-        tokio::spawn(async move {
-            confirm_wallet_transaction(wallet_rx, pend, bal).await;
-        });
+        let mut w_rx = wallet_rx;
+        let shutdown_c = shutdown.child_token();
+
+        tasks.push(tokio::spawn(async move {
+            tokio::select! {
+                _ = confirm_wallet_transaction(w_rx, pend, bal) => (),
+                _ = shutdown_c.cancelled() => info!("🔚 Arrêt du vérificateur wallet"),
+            }
+        }));
     }
 
-    // ───────────────────────── 10. Boucle principale ──────────────────────
+    // ─────────────── 10. Boucle principale ───────────────────
     {
         let wallet_c = Arc::clone(&wallet);
         let manager_c = Arc::clone(&manager);
         let buy_sem_c = Arc::clone(&buy_sem);
         let bh_rx_c = bh_rx.clone();
         let pending_c = Arc::clone(&pending);
+        let created_c = Arc::clone(&created);
+        let decode_req_tx_c = decode_req_tx.clone();
+        let shutdown_c = shutdown.child_token();
 
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
@@ -191,7 +209,7 @@ async fn main() -> Result<()> {
                         let tx = &*tx_arc;
                         if let Some(info) = &tx.transaction {
                             let sig = Signature::try_from(info.signature.clone()).unwrap();
-                            let _ = decode_req_tx.try_send(DecodeJob {
+                            let _ = decode_req_tx_c.try_send(DecodeJob {
                                 slot: tx.slot,
                                 tx_id: sig,
                                 tx_index: info.index,
@@ -207,7 +225,7 @@ async fn main() -> Result<()> {
                             Arc::clone(&wallet_c),
                             rpc_cfg.clone(),
                             bh_rx_c.clone(),
-                            &created,
+                            Arc::clone(&created_c),
                             Arc::clone(&manager_c),
                             Arc::clone(&buy_sem_c),
                             Arc::clone(&pending_c),
@@ -224,15 +242,36 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    else => break,
+                    // 10-d) Arrêt demandé
+                    _ = shutdown_c.cancelled() => {
+                        info!("🔚 Shutdown reçu dans la boucle principale");
+                        break;
+                    }
                 }
             }
-        });
+        }));
     }
 
-    // ───────────────────────── 11. Ctrl-C ─────────────────────────────────
+    // ─────────────── 11. Gestion Ctrl-C ───────────────────────
     signal::ctrl_c().await?;
-    info!("🛑 Arrêt demandé – bye !");
+    info!("🛑 SIGINT reçu – arrêt en cours…");
+    shutdown.cancel();          // réveille tous les select!
+    drop(decode_req_tx);        // ferme le canal → Rayon sort
+
+    // pause de grâce : 2 s
+    sleep(Duration::from_secs(2)).await;
+
+    // ─────────────── 12. Join / abort des tâches ─────────────
+    for mut handle in tasks {
+        if handle.is_finished() {
+            let _ = handle.await;
+        } else {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    info!("👋 Bye !");
     Ok(())
 }
 
@@ -249,12 +288,12 @@ async fn handle_decode_result(
     wallet: Arc<Wallet>,
     rpc_cfg: RpcSendTransactionConfig,
     mut bh_rx: watch::Receiver<Hash>,
-    created: &DashMap<Pubkey, ()>,
+    created: Arc<DashMap<Pubkey, ()>>,
     manager: Arc<TokenWorkerManager>,
     buy_sem: Arc<Semaphore>,
     pending: PendingTxMap,
 ) {
-    // (1) tentative d'achat
+    // (1) tentative d’achat
     if let (Some(create), Some(trade)) = (&res.create, &res.dev_trade) {
         if should_buy(trade.sol_amount) {
             let mint = create.mint;
@@ -304,7 +343,7 @@ async fn handle_decode_result(
                             .send_transaction_with_config(&buy_tx, rpc_cfg_c)
                             .await
                         {
-                            Ok(_) => info!("➡️  Buy envoyé {mint} (sig={sig})"),
+                            Ok(_)  => info!("➡️  Buy envoyé {mint} (sig={sig})"),
                             Err(e) => error!("❌ Envoi buy {mint}: {e}"),
                         }
                     }
