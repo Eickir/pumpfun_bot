@@ -74,3 +74,16 @@ pub async fn confirm_wallet_transaction(
         }
     }
 }
+
+
+/// Calcule la market-cap en SOL (f64)
+#[inline]
+pub fn market_cap(v_sol: u64, v_tok: u64) -> f64 {
+    if v_tok == 0 {
+        return 0.0;                     // évite la division par zéro
+    }
+    let sol = v_sol as f64 / 1_000_000_000.0;   // virtual SOL réservés
+    let tok = v_tok as f64 / 1_000_000.0;       // virtual TOKEN en circulation
+
+    (sol / tok) * 1_000_000_000.0
+}
