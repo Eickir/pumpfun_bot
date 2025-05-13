@@ -4,3 +4,36 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.95"
+arc-swap = "1.7.1"
+backoff = "0.4.0"
+base64 = "0.22.1"
+bs58 = "0.4"
+borsh = "0.10.3"
+chrono = "0.4"
+clickhouse = {version = "0.13.2", features = ["inserter"]}
+crossbeam = "0.8"
+dashmap = "6.1.0"
+dotenv = "0.15.0"
+flume = "0.11.1"
+futures-util = "0.3.31"
+once_cell = "1.20.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_with = "3.3"
+solana-program = "2.1.10"
+solana-sdk = "2.1.12"
+tonic = "0.12.3"
+tokio-stream = "0.1.17"
+tokio-tungstenite = { version = "0.16.1", features = ["native-tls"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+yellowstone-grpc-client = "4.1.1"
+yellowstone-grpc-proto = "4.1.1"
+reqwest = { version = "0.11", features = ["json"] }
+serde_json = "1.0.138"
+spl-associated-token-account = "6.0.0"
+solana-client = "2.1.12"
+spl-token = "7.0.0"
+rayon = "1.10"
+tokio-util = "0.7.15"
