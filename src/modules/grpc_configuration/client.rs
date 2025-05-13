@@ -1,3 +1,7 @@
+//! modules/grpc_configuration/client.rs
+//! v2 – publie un signal quand le flux **wallet** est abonné
+//!      (pour que `main` puisse attendre ce « go » avant d’analyser Pump.fun)
+
 use std::{
     collections::HashMap,
     env,
@@ -7,7 +11,10 @@ use std::{
 
 use futures_util::StreamExt;
 use once_cell::sync::Lazy;
-use tokio::{sync::mpsc::Sender, time::sleep};
+use tokio::{
+    sync::{mpsc::Sender, oneshot},
+    time::sleep,
+};
 use tonic::transport::ClientTlsConfig;
 use tracing::{error, info};
 use yellowstone_grpc_client::{GeyserGrpcClient, Interceptor};
@@ -21,71 +28,65 @@ use crate::modules::grpc_configuration::constants::{
     REQUEST_TIMEOUT,
 };
 
-// TLS racine partagé : pas de reload à chaque reconnexion
-static TLS_CONFIG: Lazy<ClientTlsConfig> =
-    Lazy::new(|| ClientTlsConfig::new().with_native_roots());
+// TLS racine partagé
+static TLS_CONFIG: Lazy<ClientTlsConfig> = Lazy::new(|| ClientTlsConfig::new().with_native_roots());
 
-/// Alias pour lisibilité
+/// Alias pratique
 type TxSub<T> = Arc<Sender<Arc<T>>>;
 
-/// ---------------------------------------------------------------------
-/// Client
-/// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+/// Client gRPC Yellowstone
+// ---------------------------------------------------------------------------
 #[derive(Clone)]
 pub struct Client {
     endpoint:   String,
     x_token:    String,
     pump_req:   SubscribeRequest,
     wallet_req: SubscribeRequest,
+    wallet_ready_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>, // ← nouveau
 }
 
 impl Client {
-    //--------------------------------------------------------------------------
-    //  new : construit le client et pré-génère les SubscribeRequest
-    //--------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    /// Construit le client et prépare les deux `SubscribeRequest`
+    // -----------------------------------------------------------------------
     pub fn new(endpoint: String, x_token: String) -> anyhow::Result<Self> {
-        // 1) pubkey du wallet (pour filtrer ses propres tx)
-        let bytes   = bs58::decode(env::var("SOLANA_PRIVATE_KEY")?).into_vec()?;
-        let pubkey  = Keypair::from_bytes(&bytes)?.pubkey().to_string();
+        // 1. pubkey du wallet
+        let bytes  = bs58::decode(env::var("SOLANA_PRIVATE_KEY")?).into_vec()?;
+        let pubkey = Keypair::from_bytes(&bytes)?.pubkey().to_string();
 
-        // 2) filtres transactions
-        let pump_filter = {
-            let mut m = HashMap::with_capacity(1);
-            m.insert(
-                "pumpfun_listener".into(),
-                SubscribeRequestFilterTransactions {
-                    vote: None,
-                    failed: Some(false),
-                    signature: None,
-                    account_include: vec![PUMPFUN_PROGRAM_ID.to_string()],
-                    account_exclude: vec![pubkey.clone()],
-                    account_required: vec![],
-                },
-            );
-            m
-        };
+        // 2. Filtres Pump.fun et wallet
+        let mut pump_filter = HashMap::new();
+        pump_filter.insert(
+            "pumpfun_listener".into(),
+            SubscribeRequestFilterTransactions {
+                vote: None,
+                failed: Some(false),
+                signature: None,
+                account_include: vec![PUMPFUN_PROGRAM_ID.to_string()],
+                account_exclude: vec![pubkey.clone()],
+                account_required: vec![],
+            },
+        );
 
-        let wallet_filter = {
-            let mut m = HashMap::with_capacity(1);
-            m.insert(
-                "my_wallet_transaction_listener".into(),
-                SubscribeRequestFilterTransactions {
-                    vote: None,
-                    failed: None,
-                    signature: None,
-                    account_include: vec![PUMPFUN_PROGRAM_ID.to_string()],
-                    account_exclude: vec![],
-                    account_required: vec![pubkey],
-                },
-            );
-            m
-        };
+        let mut wallet_filter = HashMap::new();
+        wallet_filter.insert(
+            "my_wallet_listener".into(),
+            SubscribeRequestFilterTransactions {
+                vote: None,
+                failed: None,
+                signature: None,
+                account_include: vec![PUMPFUN_PROGRAM_ID.to_string()],
+                account_exclude: vec![],
+                account_required: vec![pubkey],
+            },
+        );
 
-        // 3) BlockMeta uniquement pour le flux pumpfun
-        let mut blocks_meta = HashMap::with_capacity(1);
+        // 3. BlockMeta pour Pump.fun
+        let mut blocks_meta = HashMap::new();
         blocks_meta.insert("block_listener".into(), SubscribeRequestFilterBlocksMeta {});
 
-        // 4) gabarit
+        // 4. Gabarit
         let template = || SubscribeRequest {
             slots:               HashMap::new(),
             accounts:            HashMap::new(),
@@ -113,12 +114,24 @@ impl Client {
             r
         };
 
-        Ok(Self { endpoint, x_token, pump_req, wallet_req })
+        Ok(Self {
+            endpoint,
+            x_token,
+            pump_req,
+            wallet_req,
+            wallet_ready_tx: Arc::new(tokio::sync::Mutex::new(None)),
+        })
     }
 
-    //--------------------------------------------------------------------------
-    //  Connexion gRPC prête à l'emploi
-    //--------------------------------------------------------------------------
+    /// Le `main` injecte ici le `oneshot::Sender` à notifier
+    pub async fn set_wallet_ready_notifier(&self, tx: oneshot::Sender<()>) {
+        let mut guard = self.wallet_ready_tx.lock().await;
+        *guard = Some(tx);
+    }
+
+    // -----------------------------------------------------------------------
+    /// Ouvre la connexion gRPC avec tous les réglages
+    // -----------------------------------------------------------------------
     async fn connect(&self) -> anyhow::Result<GeyserGrpcClient<impl Interceptor>> {
         GeyserGrpcClient::build_from_shared(self.endpoint.clone())?
             .x_token(Some(self.x_token.clone()))?
@@ -130,16 +143,16 @@ impl Client {
             .tls_config((*TLS_CONFIG).clone())?
             .max_decoding_message_size(MAX_MSG_SIZE)
             .tcp_nodelay(true)
-            .initial_stream_window_size(1 << 23)    // 8 MiB
+            .initial_stream_window_size(1 << 23)
             .initial_connection_window_size(1 << 23)
             .connect()
             .await
             .map_err(Into::into)
     }
 
-    //--------------------------------------------------------------------------
-    //  Lance 2 tâches / 2 connexions : PumpFun+BlockMeta  &  Wallet
-    //--------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    /// Lance deux connexions : PumpFun(+BlockMeta) et Wallet
+    // -----------------------------------------------------------------------
     pub async fn subscribe_two_streams(
         self: Arc<Self>,
         blockmeta_tx: TxSub<SubscribeUpdateBlockMeta>,
@@ -147,16 +160,14 @@ impl Client {
         wallet_tx:    TxSub<SubscribeUpdateTransaction>,
         concurrency: usize,
     ) {
-        //----------------------------------------------------------------------
-        // 1) PumpFun + BlockMeta
-        //----------------------------------------------------------------------
+        // ========== 1. PumpFun + BlockMeta ==================================
         {
             let me   = Arc::clone(&self);
             let pump = Arc::clone(&pump_tx);
             let bm   = Arc::clone(&blockmeta_tx);
 
             tokio::spawn(async move {
-                let mut backoff = 0_u64;
+                let mut backoff = 0;
                 loop {
                     match me.connect().await {
                         Ok(mut client) => {
@@ -168,25 +179,23 @@ impl Client {
 
                                 stream
                                     .for_each_concurrent(concurrency, {
-                                        let pump_base = Arc::clone(&pump);
-                                        let bm_base   = Arc::clone(&bm);
-
+                                        let p = Arc::clone(&pump);
+                                        let b = Arc::clone(&bm);
                                         move |res| {
-                                            let pump = Arc::clone(&pump_base);
-                                            let bm   = Arc::clone(&bm_base);
-
+                                            let p = Arc::clone(&p);
+                                            let b = Arc::clone(&b);
                                             async move {
                                                 match res {
                                                     Ok(u) => match u.update_oneof {
-                                                        Some(UpdateOneof::BlockMeta(b)) => {
-                                                            let _ = bm.send(Arc::new(b)).await;
+                                                        Some(UpdateOneof::BlockMeta(m)) => {
+                                                            let _ = b.send(Arc::new(m)).await;
                                                         }
                                                         Some(UpdateOneof::Transaction(t)) => {
-                                                            let _ = pump.send(Arc::new(t)).await;
+                                                            let _ = p.send(Arc::new(t)).await;
                                                         }
                                                         _ => {}
                                                     },
-                                                    Err(e) => error!("pump stream item error: {e}"),
+                                                    Err(e) => error!("pump item error: {e}"),
                                                 }
                                             }
                                         }
@@ -204,15 +213,13 @@ impl Client {
             });
         }
 
-        //----------------------------------------------------------------------
-        // 2) Wallet
-        //----------------------------------------------------------------------
+        // ========== 2. Wallet ==============================================
         {
             let me  = Arc::clone(&self);
             let wal = Arc::clone(&wallet_tx);
 
             tokio::spawn(async move {
-                let mut backoff = 0_u64;
+                let mut backoff = 0;
                 loop {
                     match me.connect().await {
                         Ok(mut client) => {
@@ -221,22 +228,24 @@ impl Client {
                                 client.subscribe_with_request(Some(me.wallet_req.clone())).await
                             {
                                 info!("📡 wallet stream subscribed");
+                                // → notifier le main si un Sender a été fourni
+                                if let Some(tx) = me.wallet_ready_tx.lock().await.take() {
+                                    let _ = tx.send(());
+                                }
 
                                 stream
                                     .for_each_concurrent(concurrency, {
-                                        let wal_base = Arc::clone(&wal);
-
+                                        let w = Arc::clone(&wal);
                                         move |res| {
-                                            let wal = Arc::clone(&wal_base);
-
+                                            let w = Arc::clone(&w);
                                             async move {
                                                 match res {
                                                     Ok(u) => {
                                                         if let Some(UpdateOneof::Transaction(t)) = u.update_oneof {
-                                                            let _ = wal.send(Arc::new(t)).await;
+                                                            let _ = w.send(Arc::new(t)).await;
                                                         }
                                                     }
-                                                    Err(e) => error!("wallet stream item error: {e}"),
+                                                    Err(e) => error!("wallet item error: {e}"),
                                                 }
                                             }
                                         }

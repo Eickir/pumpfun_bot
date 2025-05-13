@@ -43,6 +43,7 @@ use crate::modules::{
     },
     wallet::wallet::Wallet,
 };
+use tokio::sync::oneshot;
 use yellowstone_grpc_proto::prelude::{
     SubscribeUpdateBlockMeta, SubscribeUpdateTransaction,
 };
@@ -105,6 +106,10 @@ async fn main() -> Result<()> {
 
     // ───────────── gRPC
     let client = Arc::new(Client::new(env::var("GRPC_ENDPOINT")?, env::var("X_TOKEN")?)?);
+
+    // >>> oneshot pour savoir quand le flux wallet est prêt
+    let (ready_tx, mut ready_rx) = oneshot::channel();
+    client.set_wallet_ready_notifier(ready_tx).await;
 
     // 1. Streams Yellowstone 
     let (blockmeta_tx, mut blockmeta_rx) = mpsc::channel::<Arc<SubscribeUpdateBlockMeta>>(1024);
@@ -197,22 +202,34 @@ async fn main() -> Result<()> {
         let decode_req_tx_c = decode_req_tx.clone();
         let rpc_cfg_c = rpc_cfg.clone();
         let shutdown_c = shutdown.child_token();
+        let mut wallet_ready = false;
 
         async move {
             loop {
                 tokio::select! {
                     biased;
 
+                    _ = &mut ready_rx, if !wallet_ready => {
+                        wallet_ready = true;
+                        info!("🔗 Analyse Pump.fun activée – wallet stream prêt");
+                    }
+
+
                     // (a) Flux brut Pump.fun -> Rayon
                     Some(tx_arc) = pump_rx.recv() => {
-                        if let Some(info) = &tx_arc.transaction {
-                            let sig = Signature::try_from(info.signature.clone()).unwrap();
-                            let _ = decode_req_tx_c.try_send(DecodeJob {
-                                slot: tx_arc.slot,
-                                tx_id: sig,
-                                tx_index: info.index,
-                                logs: extract_program_logs(&tx_arc),
-                            });
+                        if wallet_ready {
+                            // → on traite
+                            if let Some(info) = &tx_arc.transaction {
+                                let sig = Signature::try_from(info.signature.clone()).unwrap();
+                                let _ = decode_req_tx_c.try_send(DecodeJob {
+                                    slot: tx_arc.slot,
+                                    tx_id: sig,
+                                    tx_index: info.index,
+                                    logs: extract_program_logs(&tx_arc),
+                                });
+                            }
+                        } else {
+                            // → flux ignoré tant que wallet pas prêt
                         }
                     }
 

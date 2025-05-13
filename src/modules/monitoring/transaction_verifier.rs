@@ -68,8 +68,10 @@ pub async fn confirm_wallet_transaction(
                 }
             }
             info!("✅ tx {sig} confirmé — token {}", conf.token_pubkey);
+            drop(conf);            
         } else {
             error!("❌ tx {sig} failed");
+            drop(conf);            
             pending.remove(&sig);
         }
     }
