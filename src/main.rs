@@ -1,15 +1,19 @@
-//! src/main.rs – v3.1 (fix build + petites retouches)
+//! src/main.rs – v3.2  (intégration : vérification directe du flux wallet)
 
 use dotenv::dotenv;
-use std::{env, str::FromStr, sync::{Arc, atomic::{AtomicU64, Ordering}}};
+use std::{
+    env,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use anyhow::Result;
-use chrono::Local;
 use dashmap::DashMap;
-use flume::{bounded as flume_bounded, Receiver as FlumeReceiver, Sender as FlumeSender};
-use futures_util::StreamExt;
-use rayon::iter::ParallelBridge;
-use rayon::prelude::*;
+use flume::{bounded as flume_bounded, Receiver as FlumeReceiver, Sender as FlumeSender}; // ← utilisé seulement pour Rayon
+use rayon::{iter::ParallelBridge, prelude::*};
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_sdk::{
     hash::Hash,
@@ -21,12 +25,14 @@ use tokio::{
     signal,
     sync::{mpsc, watch, Semaphore},
 };
-use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 mod modules;
 use crate::modules::{
     grpc_configuration::client::Client,
+    monitoring::transaction_verifier::{
+        confirm_wallet_transaction, ConfirmationState, PendingTxMap, TxStatus,
+    },
     token_manager::token_manager::TokenWorkerManager,
     utils::{
         decoder::{decode_event, extract_program_logs},
@@ -38,28 +44,31 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeUpdateBlockMeta, SubscribeUpdateTransaction,
 };
 
+/// ------------------------------------------------------------------
+/// Structures internes
+/// ------------------------------------------------------------------
 struct DecodeJob {
-    slot: u64,
-    tx_id: Signature,
+    slot:     u64,
+    tx_id:    Signature,
     tx_index: u64,
-    logs: Vec<Vec<u8>>,
+    logs:     Vec<Vec<u8>>,
 }
 struct DecodeResult {
-    slot: u64,
-    tx_id: Signature,
-    tx_index: u64,
-    create: Option<crate::modules::utils::types::CreateEvent>,
+    slot:      u64,
+    tx_id:     Signature,
+    tx_index:  u64,
+    create:    Option<crate::modules::utils::types::CreateEvent>,
     dev_trade: Option<crate::modules::utils::types::TradeEvent>,
-    follow: Vec<crate::modules::utils::types::TradeEvent>,
+    follow:    Vec<crate::modules::utils::types::TradeEvent>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
     dotenv().ok();
+    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
     info!("🚀 Bot Pump.fun lancé");
 
-    // RPC
+    // ───────────────────────── 1. Config & Wallet ──────────────────────────
     let rpc_cfg = RpcSendTransactionConfig {
         skip_preflight: true,
         preflight_commitment: None,
@@ -68,25 +77,34 @@ async fn main() -> Result<()> {
         min_context_slot: None,
     };
 
-    // Wallet
-    let kp = Keypair::from_bytes(&bs58::decode(env::var("SOLANA_PRIVATE_KEY")?).into_vec()?)?;
-    let wallet = Arc::new(Wallet::new(kp, &env::var("RPC_ENDPOINT")?));
+    let keypair =
+        Keypair::from_bytes(&bs58::decode(env::var("SOLANA_PRIVATE_KEY")?).into_vec()?)?;
+    let wallet = Arc::new(Wallet::new(keypair, &env::var("RPC_ENDPOINT")?));
     let balance = wallet.get_balance().await.unwrap();
+    let wallet_balance = Arc::new(AtomicU64::new(balance));
     info!("✅ Solde: {:.4} SOL", balance as f64 / 1e9);
 
-    // Client gRPC
+    // ───────────────────────── 2. Maps partagées ──────────────────────────
+    let pending: PendingTxMap = Arc::new(DashMap::new());          // tx en attente
+    let created: DashMap<Pubkey, ()> = DashMap::with_capacity(8_192);
+
+    // ───────────────────────── 3. gRPC Client ─────────────────────────────
     let client = Arc::new(Client::new(
         env::var("GRPC_ENDPOINT")?,
         env::var("X_TOKEN")?,
     )?);
 
-    // Canaux
-    let (blockmeta_tx, mut blockmeta_rx) = mpsc::channel::<Arc<SubscribeUpdateBlockMeta>>(1024);
-    let (pump_tx,     mut pump_rx)      = mpsc::channel::<Arc<SubscribeUpdateTransaction>>(1024);
-    let (wallet_tx,   wallet_rx)        = mpsc::channel::<Arc<SubscribeUpdateTransaction>>(1024);
+    // ───────────────────────── 4. Canaux Tokio ────────────────────────────
+    let (blockmeta_tx, mut blockmeta_rx) =
+        mpsc::channel::<Arc<SubscribeUpdateBlockMeta>>(1024);
+    let (pump_tx, mut pump_rx) =
+        mpsc::channel::<Arc<SubscribeUpdateTransaction>>(1024);
+    let (wallet_tx, wallet_rx) =
+        mpsc::channel::<Arc<SubscribeUpdateTransaction>>(1024);
+
     let (decode_res_tx, mut decode_res_rx) = mpsc::channel::<DecodeResult>(1024);
 
-    // Streams Yellowstone
+    // ───────────────────────── 5. Streams Yellowstone ─────────────────────
     {
         let cli = Arc::clone(&client);
         tokio::spawn(async move {
@@ -95,97 +113,113 @@ async fn main() -> Result<()> {
                 Arc::new(pump_tx),
                 Arc::new(wallet_tx),
                 512,
-            ).await;
+            )
+            .await;
         });
     }
 
-    // Blockhash watch + slot
+    // ───────────────────────── 6. Blockhash watch ─────────────────────────
     let (bh_tx, bh_rx) = watch::channel(Hash::default());
     let last_slot = Arc::new(AtomicU64::new(0));
 
-    // Rayon pool
+    // ───────────────────────── 7. Rayon decode pool ───────────────────────
     let (decode_req_tx, decode_req_rx): (FlumeSender<DecodeJob>, FlumeReceiver<DecodeJob>) =
         flume_bounded(4_096);
     {
-        let tx_out = decode_res_tx.clone();
+        let out = decode_res_tx.clone();
         rayon::spawn_fifo(move || {
-            decode_req_rx.into_iter().par_bridge().for_each(|job| {
-                let mut create = None;
-                let mut dev    = None;
-                let mut follow = Vec::with_capacity(job.logs.len());
+            decode_req_rx
+                .into_iter()
+                .par_bridge()
+                .for_each(|job| {
+                    let mut create = None;
+                    let mut dev = None;
+                    let mut follow = Vec::with_capacity(job.logs.len());
 
-                for raw in &job.logs {
-                    if let Ok(evt) = decode_event(raw) {
-                        match evt {
-                            ParsedEvent::Create(e) => create = Some(e),
-                            ParsedEvent::Trade(e)  => { dev = Some(e.clone()); follow.push(e); }
+                    for raw in &job.logs {
+                        if let Ok(evt) = decode_event(raw) {
+                            match evt {
+                                ParsedEvent::Create(e) => create = Some(e),
+                                ParsedEvent::Trade(e) => {
+                                    dev = Some(e.clone());
+                                    follow.push(e);
+                                }
+                            }
                         }
                     }
-                }
 
-                let _ = tx_out.try_send(DecodeResult {
-                    slot: job.slot,
-                    tx_id: job.tx_id,
-                    tx_index: job.tx_index,
-                    create,
-                    dev_trade: dev,
-                    follow,
+                    let _ = out.try_send(DecodeResult {
+                        slot: job.slot,
+                        tx_id: job.tx_id,
+                        tx_index: job.tx_index,
+                        create,
+                        dev_trade: dev,
+                        follow,
+                    });
                 });
-            });
         });
     }
 
-    // Shared state
+    // ───────────────────────── 8. Autres partagés ─────────────────────────
     let manager = Arc::new(TokenWorkerManager::new(1_000));
-    let created = Arc::new(DashMap::<Pubkey, ()>::with_capacity(8_192));
     let buy_sem = Arc::new(Semaphore::const_new(128));
 
-    // Boucle principale
+    // ───────────────────────── 9. Vérificateur wallet ─────────────────────
     {
-        let wallet  = Arc::clone(&wallet);
-        let manager = Arc::clone(&manager);
-        let created = Arc::clone(&created);
-        let buy_sem = Arc::clone(&buy_sem);
-        let last_slot_ref = Arc::clone(&last_slot);
-        let bh_tx = bh_tx.clone();
+        let pend = Arc::clone(&pending);
+        let bal = Arc::clone(&wallet_balance);
+        tokio::spawn(async move {
+            confirm_wallet_transaction(wallet_rx, pend, bal).await;
+        });
+    }
+
+    // ───────────────────────── 10. Boucle principale ──────────────────────
+    {
+        let wallet_c = Arc::clone(&wallet);
+        let manager_c = Arc::clone(&manager);
+        let buy_sem_c = Arc::clone(&buy_sem);
+        let bh_rx_c = bh_rx.clone();
+        let pending_c = Arc::clone(&pending);
 
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
 
-                    // Tx PumpFun (prioritaire)
-                    Some(tx) = pump_rx.recv() => {
+                    // 10-a) Ingest PumpFun
+                    Some(tx_arc) = pump_rx.recv() => {
+                        let tx = &*tx_arc;
                         if let Some(info) = &tx.transaction {
                             let sig = Signature::try_from(info.signature.clone()).unwrap();
                             let _ = decode_req_tx.try_send(DecodeJob {
                                 slot: tx.slot,
                                 tx_id: sig,
                                 tx_index: info.index,
-                                logs: extract_program_logs(&tx),
+                                logs: extract_program_logs(tx),
                             });
                         }
                     }
 
-                    // Décodage terminé
+                    // 10-b) DecodeResult
                     Some(res) = decode_res_rx.recv() => {
                         handle_decode_result(
                             res,
-                            Arc::clone(&wallet),
+                            Arc::clone(&wallet_c),
                             rpc_cfg.clone(),
-                            bh_rx.clone(),
-                            Arc::clone(&created),
-                            Arc::clone(&manager),
-                            Arc::clone(&buy_sem),
+                            bh_rx_c.clone(),
+                            &created,
+                            Arc::clone(&manager_c),
+                            Arc::clone(&buy_sem_c),
+                            Arc::clone(&pending_c),
                         ).await;
                     }
 
-                    // BlockMeta
+                    // 10-c) BlockMeta
                     Some(bm) = blockmeta_rx.recv() => {
-                        if bm.slot > last_slot_ref.load(Ordering::Relaxed) {
-                            last_slot_ref.store(bm.slot, Ordering::Relaxed);
-                            if let Ok(hash) = Hash::from_str(&bm.blockhash) {
-                                let _ = bh_tx.send_replace(hash);
+                        if bm.slot > last_slot.load(Ordering::Relaxed) {
+                            last_slot.store(bm.slot, Ordering::Relaxed);
+                            if let Ok(h) = Hash::from_str(&bm.blockhash) {
+                                let _ = bh_tx.send_replace(h);
                             }
                         }
                     }
@@ -196,18 +230,15 @@ async fn main() -> Result<()> {
         });
     }
 
-    // wallet stream (debug)
-    #[cfg(debug_assertions)]
-    tokio::spawn(async move { ReceiverStream::new(wallet_rx).for_each(|_| async {}).await });
-    #[cfg(not(debug_assertions))]
-    drop(wallet_rx);
-
+    // ───────────────────────── 11. Ctrl-C ─────────────────────────────────
     signal::ctrl_c().await?;
     info!("🛑 Arrêt demandé – bye !");
     Ok(())
 }
 
-/// ------------------------------ Helpers ------------------------------------
+/// ------------------------------------------------------------------
+/// Helpers
+/// ------------------------------------------------------------------
 #[inline(always)]
 fn should_buy(sol: u64) -> bool {
     (500_000_000..=5_000_000_000).contains(&sol)
@@ -217,12 +248,13 @@ async fn handle_decode_result(
     res: DecodeResult,
     wallet: Arc<Wallet>,
     rpc_cfg: RpcSendTransactionConfig,
-    bh_rx: watch::Receiver<Hash>,
-    created: Arc<DashMap<Pubkey, ()>>,
+    mut bh_rx: watch::Receiver<Hash>,
+    created: &DashMap<Pubkey, ()>,
     manager: Arc<TokenWorkerManager>,
     buy_sem: Arc<Semaphore>,
+    pending: PendingTxMap,
 ) {
-    // 1) Achat
+    // (1) tentative d'achat
     if let (Some(create), Some(trade)) = (&res.create, &res.dev_trade) {
         if should_buy(trade.sol_amount) {
             let mint = create.mint;
@@ -235,51 +267,67 @@ async fn handle_decode_result(
             let sem = Arc::clone(&buy_sem);
             let trade_c = trade.clone();
             let create_c = create.clone();
-            let mut bh_rx = bh_rx.clone();
             let rpc_cfg_c = rpc_cfg.clone();
+            let pending_c = Arc::clone(&pending);
 
             tokio::spawn(async move {
-                let _p = sem.acquire().await;
+                let _permit = sem.acquire().await;
                 let bh = *bh_rx.borrow_and_update();
 
-                match wallet_c.buy_transaction(
-                    &create_c.mint,
-                    &create_c.bonding_curve,
-                    &create_c.user,
-                    0.001,
-                    0.1,
-                    trade_c,
-                    bh,
-                ).await {
+                match wallet_c
+                    .buy_transaction(
+                        &create_c.mint,
+                        &create_c.bonding_curve,
+                        &create_c.user,
+                        0.001,
+                        0.1,
+                        trade_c.clone(),
+                        bh,
+                    )
+                    .await
+                {
                     Ok(buy_tx) => {
-                        if wallet_c.rpc_client
-                            .send_transaction_with_config(&buy_tx, rpc_cfg_c).await
-                            .is_err()
+                        let sig = buy_tx.signatures[0];
+                        let (tx_watch, _rx) = watch::channel(TxStatus::Pending);
+                        pending_c.insert(sig, ConfirmationState {
+                            token_pubkey: create_c.mint,
+                            bonding_curve: create_c.bonding_curve,
+                            token_amount: 0,
+                            sol_amount: 0,
+                            virtual_sol_reserves: 0,
+                            virtual_token_reserves: 0,
+                            notifier: tx_watch,
+                        });
+
+                        match wallet_c
+                            .rpc_client
+                            .send_transaction_with_config(&buy_tx, rpc_cfg_c)
+                            .await
                         {
-                            error!("❌ Buy {} failed", mint);
-                        } else {
-                            info!("✅ Buy {} (sig={})", mint, buy_tx.signatures[0]);
+                            Ok(_) => info!("➡️  Buy envoyé {mint} (sig={sig})"),
+                            Err(e) => error!("❌ Envoi buy {mint}: {e}"),
                         }
                     }
-                    Err(e) => error!("❌ Build tx {}: {e}", mint),
+                    Err(e) => error!("❌ Construction buy {mint}: {e}"),
                 }
             });
         }
     }
 
-    // 2) Trades follow
+    // (2) trades suivants
     for tr in res.follow {
-        let mint = tr.mint;
-        if created.contains_key(&mint) {
-            manager.route_trade(
-                &mint.to_string(),
-                EnrichedTradeEvent {
-                    trade: tr,
-                    tx_id: res.tx_id.clone(),
-                    slot: res.slot,
-                    tx_index: res.tx_index,
-                },
-            ).await;
+        if created.contains_key(&tr.mint) {
+            manager
+                .route_trade(
+                    &tr.mint.to_string(),
+                    EnrichedTradeEvent {
+                        trade: tr.clone(),
+                        tx_id: res.tx_id.clone(),
+                        slot: res.slot,
+                        tx_index: res.tx_index,
+                    },
+                )
+                .await;
         }
     }
 }
