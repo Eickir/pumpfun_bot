@@ -81,12 +81,13 @@ impl TokenWorkerManager {
         }
     }
 
-    pub fn clear_after_sell(&self, mint: &Pubkey) {
+    pub fn clear_after_sell(&self, mint: &Pubkey) -> bool {
         let key = mint.to_string();
-        if let Some(mut meta) = self.metas.get_mut(&key) {
-            meta.balance = 0;
-        }
-        self.workers.remove(&key);   // ← ferme le Sender ; si le task tournait encore il s’arrêtera
+        // 1) on retire le worker (renvoie Some si présent)
+        let had_worker = self.workers.remove(&key).is_some();
+        // 2) on retire aussi les métadonnées
+        self.metas.remove(&key);
+        had_worker
     }
 
     /*───── Worker lifecycle & routage ─────*/

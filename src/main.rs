@@ -345,6 +345,7 @@ async fn main() -> Result<()> {
                         let pending_s  = Arc::clone(&pending_c);
                         let manager_s  = Arc::clone(&manager_c);
                         let rpc_cfg_s  = rpc_cfg_c.clone();
+                        let created_c = created_c.clone();
 
                         tokio::spawn(async move {
                             let _permit = sem_s.acquire().await;
@@ -417,6 +418,8 @@ async fn main() -> Result<()> {
                                     info!("💰 Sell confirmé {} ({} essais)", order.mint, attempt);
                                     manager_s.deduct_balance(&order.mint);
                                     manager_s.clear_after_sell(&order.mint);
+                                    // Purge la map `created`  → plus de routage pour ce mint
+                                    created_c.remove(&order.mint);
                                     break;
                                 } else {
                                     warn!("⏳ Sell non confirmé {} (try {}), retry…", order.mint, attempt);
