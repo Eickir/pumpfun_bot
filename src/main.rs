@@ -29,7 +29,7 @@ use tokio::{
     time::{sleep, Duration},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod modules;
 use crate::modules::{
@@ -314,54 +314,96 @@ async fn main() -> Result<()> {
                     }
 
                     /*───────────────────────────────────────────────
-                     *  (c) ORDRE DE VENTE venant d’un worker
-                     *───────────────────────────────────────────────*/
+                    *  (c) ORDRE DE VENTE – retry loop jusqu’à Successed
+                    *───────────────────────────────────────────────*/
                     Some(order) = sell_req_rx.recv() => {
                         let wallet_s   = Arc::clone(&wallet_c);
                         let mut bh_rx_s = bh_rx_c.clone();
                         let sem_s      = Arc::clone(&tx_sem_c);
                         let pending_s  = Arc::clone(&pending_c);
-                        let rpc_cfg_s  = rpc_cfg_c.clone();
                         let manager_s  = Arc::clone(&manager_c);
-                        tokio::spawn(async move {
-                            let _p = sem_s.acquire().await;
-                            let bh = *bh_rx_s.borrow_and_update();
+                        let rpc_cfg_s  = rpc_cfg_c.clone();
 
-                            match wallet_s
-                                .sell_transaction(
-                                    &order.mint,
-                                    &order.bonding_curve,
-                                    &order.creator,
-                                    order.token_amount,
-                                    bh
-                                ).await {
-                                Ok(sell_tx) => {
-                                    let sig = sell_tx.signatures[0];
-                                    let (tx_watch, mut rx) = watch::channel(TxStatus::Pending);
-                                    pending_s.insert(sig, ConfirmationState {
-                                        token_pubkey: order.mint,
-                                        bonding_curve: order.bonding_curve,
-                                        token_amount: order.token_amount,
-                                        sol_amount: 0,
-                                        virtual_sol_reserves: 0,
-                                        virtual_token_reserves: 0,
-                                        notifier: tx_watch,
-                                    });
-                                    if wallet_s.rpc_client.send_transaction_with_config(&sell_tx, rpc_cfg_s).await.is_ok() {
-                                        info!("⬅️  Sell envoyé {} (sig={})", order.mint, sig);
+                        tokio::spawn(async move {
+                            let _permit = sem_s.acquire().await;
+                            let mut attempt: u8 = 0;
+
+                            loop {
+                                attempt += 1;
+                                // rafraîchit le blockhash pour chaque essai
+                                let bh = *bh_rx_s.borrow_and_update();
+
+                                // 1. constr. transaction
+                                let sell_tx = match wallet_s
+                                    .sell_transaction(
+                                        &order.mint,
+                                        &order.bonding_curve,
+                                        &order.creator,
+                                        order.token_amount,
+                                        bh
+                                    ).await {
+                                    Ok(tx) => tx,
+                                    Err(e) => {
+                                        error!("❌ build sell {} (try {}): {}", order.mint, attempt, e);
+                                        tokio::time::sleep(Duration::from_millis(600)).await;
+                                        continue;
                                     }
-                                    while rx.changed().await.is_ok() {
-                                        if *rx.borrow() == TxStatus::Successed {
-                                            info!("💰 Sell confirmé {}", order.mint);
-                                            manager_s.deduct_balance(&order.mint);   // ← reset balance
-                                            break;
-                                        }
-                                    }
+                                };
+
+                                // 2. send
+                                let sig = sell_tx.signatures[0];
+                                let (tx_watch, mut rx) = watch::channel(TxStatus::Pending);
+                                pending_s.insert(sig, ConfirmationState {
+                                    token_pubkey: order.mint,
+                                    bonding_curve: order.bonding_curve,
+                                    token_amount: order.token_amount,
+                                    sol_amount: 0,
+                                    virtual_sol_reserves: 0,
+                                    virtual_token_reserves: 0,
+                                    notifier: tx_watch,
+                                });
+
+                                if let Err(e) = wallet_s
+                                    .rpc_client
+                                    .send_transaction_with_config(&sell_tx, rpc_cfg_s.clone())
+                                    .await
+                                {
+                                    error!("❌ send sell {} (try {}): {}", order.mint, attempt, e);
+                                    pending_s.remove(&sig);
+                                    tokio::time::sleep(Duration::from_millis(600)).await;
+                                    continue;                           // retry
                                 }
-                                Err(e) => error!("❌ sell {}: {}", order.mint, e),
-                            }
+
+                                info!("⬅️  Sell envoyé {} (sig={} try={})", order.mint, sig, attempt);
+
+                                // 3. attend la confirmation avec timeout
+                                let confirmed = tokio::time::timeout(
+                                    Duration::from_secs(25),
+                                    async {
+                                        while rx.changed().await.is_ok() {
+                                            match *rx.borrow() {
+                                                TxStatus::Successed => return true,
+                                                TxStatus::Failed    => return false,
+                                                TxStatus::Pending   => continue,
+                                            }
+                                        }
+                                        false
+                                    }
+                                ).await.unwrap_or(false);   // false si timeout
+
+                                if confirmed {
+                                    info!("💰 Sell confirmé {} ({} essais)", order.mint, attempt);
+                                    manager_s.deduct_balance(&order.mint);
+                                    break;
+                                } else {
+                                    warn!("⏳ Sell non confirmé {} (try {}), retry…", order.mint, attempt);
+                                    pending_s.remove(&sig);          // on retire l’entrée ratée
+                                    tokio::time::sleep(Duration::from_millis(800)).await;
+                                }
+                            } // loop
                         });
                     }
+
 
                     /*───────────────────────────────────────────────
                      *  (d) Trade générique ⇒ routage
