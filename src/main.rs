@@ -30,7 +30,7 @@ use tokio::{
     time::{sleep, Duration},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, debug};
 
 mod modules;
 use crate::modules::{
@@ -127,11 +127,11 @@ async fn main() -> Result<()> {
         }
     }));
 
-    // ██████████  2. Blockhash watch
+    // 2. Blockhash watch
     let (bh_tx, bh_rx) = watch::channel(Hash::default());
     let last_slot = Arc::new(AtomicU64::new(0));
 
-    // ██████████  3. Rayon decode pool (Create+Trade / Trade)
+    // 3. Rayon decode pool (Create+Trade / Trade)
     let (decode_req_tx, decode_req_rx): (FlumeSender<DecodeJob>, FlumeReceiver<DecodeJob>) = flume_bounded(4096);
     let (create_tx, mut create_rx) = mpsc::channel::<(CreateEvent, TradeEvent)>(512);
     let (trade_tx,  mut trade_rx ) = mpsc::channel::<EnrichedTradeEvent>(4096);
@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
         });
     });
 
-    // ██████████  4. Manager & listener (nouveau sender sell)
+    // 4. Manager & listener (nouveau sender sell)
     let (sell_req_tx, mut sell_req_rx) = mpsc::channel::<SellOrder>(256);
     let (manager_raw, mut event_rx) = TokenWorkerManager::new(1_000, sell_req_tx.clone());
     let manager = Arc::new(manager_raw);
@@ -173,7 +173,7 @@ async fn main() -> Result<()> {
             loop {
                 tokio::select! {
                     Some(evt) = event_rx.recv() =>
-                        info!("📈 Worker-trade: mint={} sol={:.4} slot={} sig={}",
+                        debug!("📈 Worker-trade: mint={} sol={:.4} slot={} sig={}",
                               evt.trade.mint,
                               evt.trade.sol_amount as f64 / 1e9,
                               evt.slot,
@@ -184,7 +184,7 @@ async fn main() -> Result<()> {
         }
     }));
 
-    // ██████████  5. Watcher confirmations
+    // 5. Watcher confirmations
     tasks.push(tokio::spawn({
         let pend = Arc::clone(&pending);
         let bal  = Arc::clone(&wallet_balance);
@@ -198,7 +198,7 @@ async fn main() -> Result<()> {
         }
     }));
 
-    // ██████████  6. Boucle principale (buy & sell)
+    // 6. Boucle principale (buy & sell)
     tasks.push(tokio::spawn({
         let wallet_c  = Arc::clone(&wallet);
         let manager_c = Arc::clone(&manager);
@@ -306,7 +306,7 @@ async fn main() -> Result<()> {
                                         notifier: tx_watch,
                                     });
                                     if wallet_b.rpc_client.send_transaction_with_config(&buy_tx, rpc_cfg_b).await.is_ok() {
-                                        info!("➡️  Buy envoyé {mint} (sig={sig})");
+                                        debug!("➡️  Buy envoyé {mint} (sig={sig})");
                                     }
                                     while rx.changed().await.is_ok() {
                                         if *rx.borrow() == TxStatus::Successed {
@@ -398,7 +398,7 @@ async fn main() -> Result<()> {
                                     continue;                           // retry
                                 }
 
-                                info!("⬅️  Sell envoyé {} (sig={} try={})", order.mint, sig, attempt);
+                                debug!("⬅️  Sell envoyé {} (sig={} try={})", order.mint, sig, attempt);
 
                                 // 3. attend la confirmation avec timeout
                                 let confirmed = tokio::time::timeout(
