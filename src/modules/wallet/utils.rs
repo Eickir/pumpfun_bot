@@ -103,8 +103,8 @@ pub fn sell_instructions(
             AccountMeta::new(associated_user, false),
             AccountMeta::new(*payer, true),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
-            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             AccountMeta::new(creator_vault, false), // PDA calculée pour le creator_vault
+            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             AccountMeta::new_readonly(EVENT_AUTHORITY, false),
             AccountMeta::new_readonly(PROGRAM_ID, false),
         ]

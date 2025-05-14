@@ -9,6 +9,7 @@ use std::{
         Arc,
     },
 };
+use crate::modules::token_manager::token_manager::SellOrder;
 use crate::modules::monitoring::transaction_verifier::market_cap;
 use anyhow::Result;
 use dashmap::DashMap;
@@ -83,7 +84,7 @@ async fn main() -> Result<()> {
     // ───────────── infra de base
     let shutdown = CancellationToken::new();
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-    let buy_sem: Arc<Semaphore> = Arc::new(Semaphore::const_new(128));
+    let tx_sem: Arc<Semaphore> = Arc::new(Semaphore::const_new(128));     // buy & sell
 
     // ───────────── wallet
     let rpc_cfg = RpcSendTransactionConfig {
@@ -157,9 +158,11 @@ async fn main() -> Result<()> {
         });
     });
 
-    // ██████████  4. Manager & listener
-    let (manager_raw, mut event_rx) = TokenWorkerManager::new(1_000);
+    // ██████████  4. Manager & listener (nouveau sender sell)
+    let (sell_req_tx, mut sell_req_rx) = mpsc::channel::<SellOrder>(256);
+    let (manager_raw, mut event_rx) = TokenWorkerManager::new(1_000, sell_req_tx.clone());
     let manager = Arc::new(manager_raw);
+
     tasks.push(tokio::spawn({
         let shutdown_c = shutdown.child_token();
         async move {
@@ -191,11 +194,11 @@ async fn main() -> Result<()> {
         }
     }));
 
-    // 6. Boucle principale
+    // ██████████  6. Boucle principale (buy & sell)
     tasks.push(tokio::spawn({
         let wallet_c  = Arc::clone(&wallet);
         let manager_c = Arc::clone(&manager);
-        let buy_sem_c = Arc::clone(&buy_sem);
+        let tx_sem_c  = Arc::clone(&tx_sem);
         let bh_rx_c   = bh_rx.clone();
         let created_c = Arc::clone(&created);
         let pending_c = Arc::clone(&pending);
@@ -214,11 +217,11 @@ async fn main() -> Result<()> {
                         info!("🔗 Analyse Pump.fun activée – wallet stream prêt");
                     }
 
-
-                    // (a) Flux brut Pump.fun -> Rayon
+                    /*───────────────────────────────────────────────
+                     *  (a) Flux brut Pump.fun -> Rayon
+                     *───────────────────────────────────────────────*/
                     Some(tx_arc) = pump_rx.recv() => {
                         if wallet_ready {
-                            // → on traite
                             if let Some(info) = &tx_arc.transaction {
                                 let sig = Signature::try_from(info.signature.clone()).unwrap();
                                 let _ = decode_req_tx_c.try_send(DecodeJob {
@@ -228,27 +231,27 @@ async fn main() -> Result<()> {
                                     logs: extract_program_logs(&tx_arc),
                                 });
                             }
-                        } else {
-                            // → flux ignoré tant que wallet pas prêt
                         }
                     }
 
-                    // (b) Tx Create+Trade ⇒ buy
+                    /*───────────────────────────────────────────────
+                     *  (b) Tx Create+Trade ⇒ BUY
+                     *───────────────────────────────────────────────*/
                     Some((create_evt, dev_trade)) = create_rx.recv() => {
                         let mint = create_evt.mint;
                         if created_c.contains_key(&mint) { continue; }
                         if !should_buy(dev_trade.sol_amount) { continue; }
 
-                        let buy_mc = market_cap(
-                            dev_trade.virtual_sol_reserves,
-                            dev_trade.virtual_token_reserves
-                        );
+                        /*─────────────────────── NEW ───────────────────────*/
+                        // on mémorise bonding_curve & creator pour ce mint
+                        manager_c.register_meta(&mint, &create_evt.bonding_curve, &create_evt.user);
+                        /*────────────────────────────────────────────────────*/
 
                         created_c.insert(mint, MintState { create: create_evt.clone(), buy_mc: 0.0, confirmed: false });
 
                         // spawn l'achat
                         let wallet_b  = Arc::clone(&wallet_c);
-                        let sem_b     = Arc::clone(&buy_sem_c);
+                        let sem_b     = Arc::clone(&tx_sem_c);
                         let mut bh_rx_b = bh_rx_c.clone();
                         let pending_b = Arc::clone(&pending_c);
                         let created_b = Arc::clone(&created_c);
@@ -289,13 +292,16 @@ async fn main() -> Result<()> {
                                                     conf.virtual_sol_reserves,
                                                     conf.virtual_token_reserves,
                                                 );
+                                                let qty = conf.token_amount;        // ← quantité reçue
                                                 info!("✅ Buy confirmé {mint} – MC entrée ≈ {:.2} SOL", real_mc);
                                     
-                                                // mettre à jour l’état du mint
                                                 if let Some(mut st) = created_b.get_mut(&mint) {
                                                     st.buy_mc   = real_mc;
                                                     st.confirmed = true;
                                                 }
+
+                                                /* NOUVEAU : communique le solde réel au manager */
+                                                manager_b.update_balance(&mint, qty);
                                             }
                                             manager_b.ensure_worker(&mint.to_string());
                                             break;
@@ -307,7 +313,59 @@ async fn main() -> Result<()> {
                         });
                     }
 
-                    // (c) Trade générique ⇒ comparaison MC & routage
+                    /*───────────────────────────────────────────────
+                     *  (c) ORDRE DE VENTE venant d’un worker
+                     *───────────────────────────────────────────────*/
+                    Some(order) = sell_req_rx.recv() => {
+                        let wallet_s   = Arc::clone(&wallet_c);
+                        let mut bh_rx_s = bh_rx_c.clone();
+                        let sem_s      = Arc::clone(&tx_sem_c);
+                        let pending_s  = Arc::clone(&pending_c);
+                        let rpc_cfg_s  = rpc_cfg_c.clone();
+                        let manager_s  = Arc::clone(&manager_c);
+                        tokio::spawn(async move {
+                            let _p = sem_s.acquire().await;
+                            let bh = *bh_rx_s.borrow_and_update();
+
+                            match wallet_s
+                                .sell_transaction(
+                                    &order.mint,
+                                    &order.bonding_curve,
+                                    &order.creator,
+                                    order.token_amount,
+                                    bh
+                                ).await {
+                                Ok(sell_tx) => {
+                                    let sig = sell_tx.signatures[0];
+                                    let (tx_watch, mut rx) = watch::channel(TxStatus::Pending);
+                                    pending_s.insert(sig, ConfirmationState {
+                                        token_pubkey: order.mint,
+                                        bonding_curve: order.bonding_curve,
+                                        token_amount: order.token_amount,
+                                        sol_amount: 0,
+                                        virtual_sol_reserves: 0,
+                                        virtual_token_reserves: 0,
+                                        notifier: tx_watch,
+                                    });
+                                    if wallet_s.rpc_client.send_transaction_with_config(&sell_tx, rpc_cfg_s).await.is_ok() {
+                                        info!("⬅️  Sell envoyé {} (sig={})", order.mint, sig);
+                                    }
+                                    while rx.changed().await.is_ok() {
+                                        if *rx.borrow() == TxStatus::Successed {
+                                            info!("💰 Sell confirmé {}", order.mint);
+                                            manager_s.deduct_balance(&order.mint);   // ← reset balance
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => error!("❌ sell {}: {}", order.mint, e),
+                            }
+                        });
+                    }
+
+                    /*───────────────────────────────────────────────
+                     *  (d) Trade générique ⇒ routage
+                     *───────────────────────────────────────────────*/
                     Some(evt) = trade_rx.recv() => {
                         if let Some(state) = created_c.get(&evt.trade.mint) {
                             if state.confirmed {
@@ -326,7 +384,9 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // (d) BlockMeta
+                    /*───────────────────────────────────────────────
+                     *  (e) BlockMeta
+                     *───────────────────────────────────────────────*/
                     Some(bm) = blockmeta_rx.recv() => {
                         if bm.slot > last_slot.load(Ordering::Relaxed) {
                             last_slot.store(bm.slot, Ordering::Relaxed);
@@ -336,7 +396,9 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // (e) shutdown
+                    /*───────────────────────────────────────────────
+                     *  (f) shutdown
+                     *───────────────────────────────────────────────*/
                     _ = shutdown_c.cancelled() => break,
                 }
             }
@@ -349,7 +411,10 @@ async fn main() -> Result<()> {
     shutdown.cancel();
     drop(decode_req_tx);
     sleep(Duration::from_secs(2)).await;
-    for mut h in tasks { if h.is_finished() { let _ = h.await; } else { h.abort(); let _ = h.await; } }
+    for mut h in tasks {
+        if h.is_finished() { let _ = h.await; }
+        else { h.abort(); let _ = h.await; }
+    }
     info!("👋 Bye !");
     Ok(())
 }
