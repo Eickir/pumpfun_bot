@@ -247,6 +247,7 @@ async fn main() -> Result<()> {
                         let mint = create_evt.mint;
                         if created_c.contains_key(&mint) { continue; }
                         if !should_buy(dev_trade.sol_amount) { continue; }
+                        if !wallet.is_wallet_new(dev_trade.user).await { continue; }
 
                         /* 2) NOUVEAU : test de solde disponible */
                         let cur_sol = balance_c.load(Ordering::Relaxed);
