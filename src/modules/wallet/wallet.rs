@@ -53,6 +53,30 @@ impl Wallet {
         Ok(balance)
     }
 
+    /// Détecte si un wallet est « nouveau » : moins de 15 signatures et au moins 1.
+    pub async fn is_wallet_new(
+        &self,
+        wallet_pubkey: Pubkey
+    ) -> bool {
+        // récupère les dernières signatures de l'adresse
+        let sigs = match self.rpc_client
+            .get_signatures_for_address(&wallet_pubkey)
+            .await
+        {
+            Ok(sigs) => sigs,
+            Err(_) => return false,
+        };
+
+        // récent : 1..14 signatures ; 0 ou ≥15 = pas nouveau
+        if sigs.len() >= 15 {
+            false
+        } else if sigs.is_empty() {
+            false
+        } else {
+            true
+        }
+    }
+
     pub async fn buy_transaction(
         &self,
         mint: &Pubkey,
