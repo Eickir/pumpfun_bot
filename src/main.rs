@@ -22,6 +22,7 @@ use solana_sdk::{
     signature::Signature,
     signer::keypair::Keypair,
 };
+use crate::modules::wallet::constants::LAMPORTS_PER_SOL;
 use tokio::{
     signal,
     sync::{mpsc, watch, Semaphore},
@@ -74,6 +75,9 @@ struct MintState {
     buy_mc: f64,
     confirmed: bool,        // false avant confirmation du buy, true après
 }
+
+const MIN_FREE_BALANCE_SOL: f64 = 0.07;   
+
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -200,6 +204,7 @@ async fn main() -> Result<()> {
         let manager_c = Arc::clone(&manager);
         let tx_sem_c  = Arc::clone(&tx_sem);
         let bh_rx_c   = bh_rx.clone();
+        let balance_c = Arc::clone(&wallet_balance);
         let created_c = Arc::clone(&created);
         let pending_c = Arc::clone(&pending);
         let decode_req_tx_c = decode_req_tx.clone();
@@ -209,6 +214,7 @@ async fn main() -> Result<()> {
 
         async move {
             loop {
+                let balance_c = Arc::clone(&wallet_balance);
                 tokio::select! {
                     biased;
 
@@ -242,6 +248,15 @@ async fn main() -> Result<()> {
                         if created_c.contains_key(&mint) { continue; }
                         if !should_buy(dev_trade.sol_amount) { continue; }
 
+                        /* 2) NOUVEAU : test de solde disponible */
+                        let cur_sol = balance_c.load(Ordering::Relaxed);
+                        if cur_sol < (MIN_FREE_BALANCE_SOL * LAMPORTS_PER_SOL as f64) as u64 {
+                            warn!("⏳ Solde {:.3} SOL < seuil {:.3} SOL → skip achat {mint}",
+                                cur_sol as f64 / LAMPORTS_PER_SOL as f64,
+                                MIN_FREE_BALANCE_SOL);
+                            continue;
+                        }
+
                         /*─────────────────────── NEW ───────────────────────*/
                         // on mémorise bonding_curve & creator pour ce mint
                         manager_c.register_meta(&mint, &create_evt.bonding_curve, &create_evt.user);
@@ -261,6 +276,13 @@ async fn main() -> Result<()> {
                         tokio::spawn(async move {
                             let _p = sem_b.acquire().await;
                             let bh = *bh_rx_b.borrow_and_update();
+
+                            let needed = (0.001 * LAMPORTS_PER_SOL as f64) as u64; // coût visé (0,001 SOL)
+                            if balance_c.load(Ordering::Relaxed) < needed + (MIN_FREE_BALANCE_SOL * LAMPORTS_PER_SOL as f64) as u64 {
+                                warn!("Solde devenu trop bas juste avant l’envoi → abandon buy {mint}");
+                                return;
+                            }
+
                             match wallet_b.buy_transaction(
                                 &mint,
                                 &create_evt.bonding_curve,
@@ -394,6 +416,7 @@ async fn main() -> Result<()> {
                                 if confirmed {
                                     info!("💰 Sell confirmé {} ({} essais)", order.mint, attempt);
                                     manager_s.deduct_balance(&order.mint);
+                                    manager_s.clear_after_sell(&order.mint);
                                     break;
                                 } else {
                                     warn!("⏳ Sell non confirmé {} (try {}), retry…", order.mint, attempt);

@@ -81,6 +81,14 @@ impl TokenWorkerManager {
         }
     }
 
+    pub fn clear_after_sell(&self, mint: &Pubkey) {
+        let key = mint.to_string();
+        if let Some(mut meta) = self.metas.get_mut(&key) {
+            meta.balance = 0;
+        }
+        self.workers.remove(&key);   // ← ferme le Sender ; si le task tournait encore il s’arrêtera
+    }
+
     /*───── Worker lifecycle & routage ─────*/
 
     /// Retourne (ou crée) le Sender associé au token
