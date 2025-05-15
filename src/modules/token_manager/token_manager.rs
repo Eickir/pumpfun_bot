@@ -3,7 +3,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::mpsc::{self, channel, Sender, UnboundedReceiver, UnboundedSender};
-use tracing::{error, info};
+use tracing::{error, info, debug};
 
 use crate::modules::utils::types::EnrichedTradeEvent;
 
@@ -109,10 +109,10 @@ impl TokenWorkerManager {
         let metas        = Arc::clone(&self.metas);
 
         tokio::spawn(async move {
-            info!("🆕 Worker démarré pour {token_string}");
+            debug!("🆕 Worker démarré pour {token_string}");
             let mut entry_mc: Option<f64> = None;
-            let take_profit = 10.0;   // +30 %
-            let stop_loss   = -2.0;   // –3 %
+            let take_profit = 50.0;   // +30 %
+            let stop_loss   = -10.0;   // –3 %
 
             while let Some(trade) = rx.recv().await {
                 let _ = event_tx.send(trade.clone());   // diffusion globale
@@ -141,7 +141,7 @@ impl TokenWorkerManager {
                             }).await;
                             info!("🎯 Seuil atteint → demande de SELL pour {token_string}");
                         } else {
-                            info!("⚠️ Pas de solde à vendre pour {token_string}");
+                            error!("⚠️ Pas de solde à vendre pour {token_string}");
                         }
                     } else {
                         error!("Meta manquante pour {token_string}");
