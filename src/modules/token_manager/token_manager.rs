@@ -1,13 +1,13 @@
 use std::sync::Arc;
+use std::str::FromStr;
 
 use dashmap::DashMap;
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::mpsc::{self, channel, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::time::{sleep, Instant, Duration};
 use tracing::{error, info, debug};
 
 use crate::modules::utils::types::EnrichedTradeEvent;
-
-/*──────────────────── Structures publiques ────────────────────*/
 
 /// Ordre de vente envoyé par un worker → main
 #[derive(Clone, Debug)]
@@ -15,17 +15,15 @@ pub struct SellOrder {
     pub mint: Pubkey,
     pub bonding_curve: Pubkey,
     pub creator: Pubkey,
-    pub token_amount: u64,   // solde du bot à liquider
+    pub token_amount: u64,
 }
-
-/*──────────────────── Structures internes ────────────────────*/
 
 /// Méta-données + position courante d’un token
 #[derive(Clone, Copy, Debug)]
 pub struct TokenMeta {
     pub bonding_curve: Pubkey,
     pub creator: Pubkey,
-    pub balance: u64,          // tokens détenus par le bot
+    pub balance: u64,
 }
 
 /// Manager principal
@@ -37,9 +35,8 @@ pub struct TokenWorkerManager {
     sell_req_tx:  mpsc::Sender<SellOrder>,
 }
 
-/*──────────────────── Implémentation ────────────────────*/
-
 impl TokenWorkerManager {
+    /// Crée un nouveau manager avec capacité donnée
     pub fn new(
         capacity: usize,
         sell_req_tx: mpsc::Sender<SellOrder>,
@@ -47,8 +44,8 @@ impl TokenWorkerManager {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         (
             Self {
-                workers: Arc::new(DashMap::with_capacity(capacity)),
-                metas:   Arc::new(DashMap::with_capacity(capacity)),
+                workers:     Arc::new(DashMap::with_capacity(capacity)),
+                metas:       Arc::new(DashMap::with_capacity(capacity)),
                 capacity,
                 event_tx,
                 sell_req_tx,
@@ -57,13 +54,15 @@ impl TokenWorkerManager {
         )
     }
 
-    /*───── APIs appelées depuis main.rs ─────*/
-
     /// Enregistre les infos statiques du CreateEvent
     pub fn register_meta(&self, mint: &Pubkey, bonding_curve: &Pubkey, creator: &Pubkey) {
         self.metas.insert(
             mint.to_string(),
-            TokenMeta { bonding_curve: *bonding_curve, creator: *creator, balance: 0 },
+            TokenMeta {
+                bonding_curve: *bonding_curve,
+                creator:       *creator,
+                balance:       0,
+            },
         );
     }
 
@@ -81,18 +80,15 @@ impl TokenWorkerManager {
         }
     }
 
+    /// Nettoyage après vente : retire worker et meta
     pub fn clear_after_sell(&self, mint: &Pubkey) -> bool {
         let key = mint.to_string();
-        // 1) on retire le worker (renvoie Some si présent)
         let had_worker = self.workers.remove(&key).is_some();
-        // 2) on retire aussi les métadonnées
         self.metas.remove(&key);
         had_worker
     }
 
-    /*───── Worker lifecycle & routage ─────*/
-
-    /// Retourne (ou crée) le Sender associé au token
+    /// Retourne (ou crée) le Sender associé au token, avec timeout d’inactivité
     pub fn ensure_worker(&self, token: &str) -> Sender<EnrichedTradeEvent> {
         if let Some(tx) = self.workers.get(token) {
             return tx.clone();
@@ -102,54 +98,101 @@ impl TokenWorkerManager {
         let (tx, mut rx) = channel(self.capacity);
         self.workers.insert(token.to_string(), tx.clone());
 
-        // clones pour le task
+        // clonages pour le task
         let token_string = token.to_string();
         let event_tx     = self.event_tx.clone();
         let sell_tx      = self.sell_req_tx.clone();
         let metas        = Arc::clone(&self.metas);
 
         tokio::spawn(async move {
-            debug!("🆕 Worker démarré pour {token_string}");
+            debug!("🆕 Worker démarré pour {}", token_string);
+
             let mut entry_mc: Option<f64> = None;
-            let take_profit = 50.0;   // +30 %
-            let stop_loss   = -10.0;   // –3 %
+            let take_profit = 50.0;   // +50 %
+            let stop_loss   = -10.0;  // –10 %
 
-            while let Some(trade) = rx.recv().await {
-                let _ = event_tx.send(trade.clone());   // diffusion globale
+            // timer d'inactivité de 15 secondes
+            let mut inactivity = sleep(Duration::from_secs(15));
+            tokio::pin!(inactivity);
 
-                // MC courante
-                let mc = crate::modules::monitoring::transaction_verifier::market_cap(
-                    trade.trade.virtual_sol_reserves,
-                    trade.trade.virtual_token_reserves,
-                );
+            loop {
+                tokio::select! {
+                    // Réception d'un nouveau trade
+                    maybe_trade = rx.recv() => {
+                        match maybe_trade {
+                            Some(trade) => {
+                                // Reset du timer
+                                inactivity.as_mut().reset(Instant::now() + Duration::from_secs(15));
 
-                if entry_mc.is_none() {
-                    entry_mc = Some(mc);     // prix d’entrée
-                    continue;
-                }
-                let pct = (mc / entry_mc.unwrap() - 1.0) * 100.0;
+                                // Diffusion globale
+                                let _ = event_tx.send(trade.clone());
 
-                if pct >= take_profit || pct <= stop_loss {
-                    // solde détenu ?
-                    if let Some(meta) = metas.get(&token_string) {
-                        if meta.balance > 0 {
-                            let _ = sell_tx.send(SellOrder {
-                                mint: trade.trade.mint,
-                                bonding_curve: meta.bonding_curve,
-                                creator: meta.creator,
-                                token_amount: meta.balance,
-                            }).await;
-                            info!("🎯 Seuil atteint → demande de SELL pour {token_string}");
-                        } else {
-                            error!("⚠️ Pas de solde à vendre pour {token_string}");
+                                // Calcul du market cap
+                                let mc = crate::modules::monitoring::transaction_verifier::market_cap(
+                                    trade.trade.virtual_sol_reserves,
+                                    trade.trade.virtual_token_reserves,
+                                );
+
+                                // Premier trade → on enregistre le prix d'entrée
+                                if entry_mc.is_none() {
+                                    entry_mc = Some(mc);
+                                    continue;
+                                }
+
+                                // Variation %
+                                let pct = (mc / entry_mc.unwrap() - 1.0) * 100.0;
+                                if pct >= take_profit || pct <= stop_loss {
+                                    if let Some(meta) = metas.get(&token_string) {
+                                        if meta.balance > 0 {
+                                            let _ = sell_tx.send(SellOrder {
+                                                mint:           trade.trade.mint,
+                                                bonding_curve:  meta.bonding_curve,
+                                                creator:        meta.creator,
+                                                token_amount:   meta.balance,
+                                            }).await;
+                                            info!("🎯 Seuil atteint → demande de SELL pour {}", token_string);
+                                        } else {
+                                            error!("⚠️ Pas de solde à vendre pour {}", token_string);
+                                        }
+                                    } else {
+                                        error!("❌ Meta manquante pour {}", token_string);
+                                    }
+                                    break;
+                                }
+                            }
+                            None => {
+                                // Canal fermé → arrêt
+                                break;
+                            }
                         }
-                    } else {
-                        error!("Meta manquante pour {token_string}");
                     }
-                    break;  // worker stoppe après la vente
-                }
-            }
-            info!("🛑 Worker arrêté pour {token_string}");
+
+                    // Timeout d'inactivité
+                    _ = &mut inactivity => {
+                        if let Some(meta) = metas.get(&token_string) {
+                            if meta.balance > 0 {
+                                // Reconversion du token string en Pubkey
+                                let mint_pk = Pubkey::from_str(&token_string)
+                                    .expect("Token string invalide");
+                                let _ = sell_tx.send(SellOrder {
+                                    mint:           mint_pk,
+                                    bonding_curve:  meta.bonding_curve,
+                                    creator:        meta.creator,
+                                    token_amount:   meta.balance,
+                                }).await;
+                                info!("⏱️ 15s d’inactivité → demande de SELL pour {}", token_string);
+                            } else {
+                                error!("⚠️ Pas de solde à vendre pour {} après inactivité", token_string);
+                            }
+                        } else {
+                            error!("❌ Meta manquante pour {} après inactivité", token_string);
+                        }
+                        break;
+                    }
+                } // tokio::select!
+            } // loop
+
+            info!("🛑 Worker arrêté pour {}", token_string);
         });
 
         tx
@@ -159,7 +202,7 @@ impl TokenWorkerManager {
     pub async fn route_trade(&self, token: &str, trade: EnrichedTradeEvent) {
         let tx = self.ensure_worker(token);
         if let Err(e) = tx.send(trade).await {
-            error!("Worker mort pour {token}: {e:?}");
+            error!("Worker mort pour {}: {:?}", token, e);
             self.workers.remove(token);
         }
     }
