@@ -16,7 +16,7 @@ use tokio::{
     time::sleep,
 };
 use tonic::transport::ClientTlsConfig;
-use tracing::{error, info};
+use tracing::{error, info, debug};
 use yellowstone_grpc_client::{GeyserGrpcClient, Interceptor};
 use yellowstone_grpc_proto::prelude::*;
 use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
@@ -175,7 +175,7 @@ impl Client {
                             if let Ok((_sink, mut stream)) =
                                 client.subscribe_with_request(Some(me.pump_req.clone())).await
                             {
-                                info!("📡 pumpfun stream subscribed");
+                                debug!("📡 pumpfun stream subscribed");
 
                                 stream
                                     .for_each_concurrent(concurrency, {
@@ -227,7 +227,7 @@ impl Client {
                             if let Ok((_sink, mut stream)) =
                                 client.subscribe_with_request(Some(me.wallet_req.clone())).await
                             {
-                                info!("📡 wallet stream subscribed");
+                                debug!("📡 wallet stream subscribed");
                                 // → notifier le main si un Sender a été fourni
                                 if let Some(tx) = me.wallet_ready_tx.lock().await.take() {
                                     let _ = tx.send(());
