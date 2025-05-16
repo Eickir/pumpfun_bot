@@ -76,7 +76,7 @@ struct MintState {
     confirmed: bool,        // false avant confirmation du buy, true après
 }
 
-const MIN_FREE_BALANCE_SOL: f64 = 0.07;   
+const MIN_FREE_BALANCE_SOL: f64 = 0.5;   
 
 
 #[tokio::main(flavor = "multi_thread")]
@@ -191,10 +191,7 @@ async fn main() -> Result<()> {
         let mut w_rx = wallet_rx;
         let shutdown_c = shutdown.child_token();
         async move {
-            tokio::select! {
-                _ = confirm_wallet_transaction(w_rx, pend, bal) => (),
-                _ = shutdown_c.cancelled() => (),
-            }
+            confirm_wallet_transaction(w_rx, pend, bal, shutdown_c).await;
         }
     }));
 
@@ -220,7 +217,7 @@ async fn main() -> Result<()> {
 
                     _ = &mut ready_rx, if !wallet_ready => {
                         wallet_ready = true;
-                        info!("🔗 Analyse Pump.fun activée – wallet stream prêt");
+                        info!("🔗 Analyse Pump.fun activée – tous les streams sont prêts");
                     }
 
                     /*───────────────────────────────────────────────
@@ -288,8 +285,8 @@ async fn main() -> Result<()> {
                                 &mint,
                                 &create_evt.bonding_curve,
                                 &create_evt.user,
-                                0.001,
                                 0.1,
+                                0.2,
                                 dev_trade.clone(),
                                 bh
                             ).await {
@@ -493,7 +490,7 @@ async fn main() -> Result<()> {
 /// ------------------------------------------------------------------
 #[inline(always)]
 fn should_buy(sol: u64) -> bool {
-    (500_000_000..=5_000_000_000).contains(&sol)
+    (500_000_000..=4_000_000_000).contains(&sol)
 }
 
 async fn handle_decode_result(

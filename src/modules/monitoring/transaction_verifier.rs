@@ -2,7 +2,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-
+use tokio_util::sync::CancellationToken;
 use bincode::deserialize;
 use dashmap::DashMap;
 use solana_sdk::{
@@ -56,74 +56,90 @@ pub async fn confirm_wallet_transaction(
     mut wallet_rx: mpsc::Receiver<Arc<SubscribeUpdateTransaction>>,
     pending:      PendingTxMap,
     wallet_balance: Arc<AtomicU64>,
+    shutdown:     CancellationToken,
 ) {
-    while let Some(wtx_arc) = wallet_rx.recv().await {
-        let wtx = &*wtx_arc;
-
-        // 1. Extraire la signature
-        let sig = match wtx.transaction
-            .as_ref()
-            .and_then(|t| Signature::try_from(t.signature.clone()).ok())
-        {
-            Some(s) => s,
-            None    => continue,
-        };
-
-        // 2. Récupérer l’état en attente
-        let mut conf = match pending.get_mut(&sig) {
-            Some(c) => c,
-            None    => continue,
-        };
-
-        // 3. Récupérer meta (post_balances + err)
-        let Some(meta) = wtx.transaction
-            .as_ref()
-            .and_then(|t| t.meta.as_ref())
-        else {
-            // pas de meta ⇒ abandon
-            pending.remove(&sig);
-            continue;
-        };
-
-        // 4. Met à jour le solde on‐chain
-        wallet_balance.store(meta.post_balances[0], Ordering::Relaxed);
-
-        // 5. Déterminer le statut en tenant compte du code 3012
-        let status = if meta.err.is_none() {
-            TxStatus::Successed
-        } else {
-            // meta.err contient les bytes bincode de TransactionError
-            let err_bytes = &meta.err.as_ref().unwrap().err;
-            if let Some(3012) = extract_error_code(&err_bytes) {
-                TxStatus::Successed
-            } else {
-                TxStatus::Failed
+    loop {
+        tokio::select! {
+            // si on demande l'arrêt, on sort de la boucle
+            _ = shutdown.cancelled() => {
+                info!("🛑 Arrêt de confirm_wallet_transaction");
+                break;
             }
-        };
 
-        // 6. Notifier le watcher interne
-        let _ = conf.notifier.send(status.clone());
+            // sinon on attend une mise à jour de transaction
+            maybe = wallet_rx.recv() => {
+                let wtx_arc = match maybe {
+                    Some(w) => w,
+                    None    => {
+                        // tous les senders ont été drop, on peut aussi sortir
+                        info!("🔒 wallet_rx fermé, fin de confirm_wallet_transaction");
+                        break;
+                    }
+                };
+                let wtx = &*wtx_arc;
 
-        // 7. Brancher selon succès ou échec
-        if status == TxStatus::Successed {
-            // mettre à jour les champs depuis les logs
-            for raw in extract_program_logs(wtx) {
-                if let Ok(ParsedEvent::Trade(t)) = decode_event(&raw) {
-                    conf.token_amount           = t.token_amount;
-                    conf.virtual_sol_reserves   = t.virtual_sol_reserves;
-                    conf.virtual_token_reserves = t.virtual_token_reserves;
-                    conf.sol_amount             = t.sol_amount;
+                // -- le reste de votre logique inchangée, à l’exception des drop(conf) avant remove --
+                // 1. Extraire la signature
+                let sig = match wtx.transaction
+                    .as_ref()
+                    .and_then(|t| Signature::try_from(t.signature.clone()).ok())
+                {
+                    Some(s) => s,
+                    None    => continue,
+                };
+
+                // 2. Récupérer l’état en attente
+                let mut conf = match pending.get_mut(&sig) {
+                    Some(c) => c,
+                    None    => continue,
+                };
+
+                // 3. Récupérer meta (post_balances + err)
+                let meta = match wtx.transaction.as_ref().and_then(|t| t.meta.as_ref()) {
+                    Some(m) => m,
+                    None    => {
+                        drop(conf);
+                        pending.remove(&sig);
+                        continue;
+                    }
+                };
+
+                // 4. Met à jour le solde on‐chain
+                wallet_balance.store(meta.post_balances[0], Ordering::Relaxed);
+
+                // 5. Déterminer le statut en tenant compte du code 3012
+                let status = if meta.err.is_none() {
+                    TxStatus::Successed
+                } else {
+                    let err_bytes = &meta.err.as_ref().unwrap().err;
+                    if let Some(3012) = extract_error_code(&err_bytes) {
+                        TxStatus::Successed
+                    } else {
+                        TxStatus::Failed
+                    }
+                };
+
+                // 6. Notifier le watcher interne
+                let _ = conf.notifier.send(status.clone());
+
+                // 7. Brancher selon succès ou échec
+                if status == TxStatus::Successed {
+                    // mettre à jour depuis les logs
+                    for raw in extract_program_logs(wtx) {
+                        if let Ok(ParsedEvent::Trade(t)) = decode_event(&raw) {
+                            conf.token_amount           = t.token_amount;
+                            conf.virtual_sol_reserves   = t.virtual_sol_reserves;
+                            conf.virtual_token_reserves = t.virtual_token_reserves;
+                            conf.sol_amount             = t.sol_amount;
+                        }
+                    }
+                    info!("✅ tx {} confirmé — token {}", sig, conf.token_pubkey);
+                } else {
+                    error!("❌ tx {} failed", sig);
+                    drop(conf);
+                    pending.remove(&sig);
                 }
             }
-            info!(
-                "✅ tx {} confirmé — token {}",
-                sig, conf.token_pubkey
-            );
-            // on garde l’entrée dans pending si besoin de relecture
-        } else {
-            error!("❌ tx {} failed", sig);
-            // abandon définitif
-            pending.remove(&sig);
         }
     }
 }
